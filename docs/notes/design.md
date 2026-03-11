@@ -23,6 +23,15 @@ parallel stack manager.
 
 For an MVP, the tool can be almost stateless.
 
+## Design Goals
+
+1. Make stacked GitHub PRs feel natural in a `jj` workflow.
+2. Be easy to use.
+3. Avoid out-of-band metadata as a source of truth.
+4. Keep branch names stable across rewrite-heavy review.
+5. Recompute as much as possible from `jj` state on every run.
+6. Keep any persisted state optional, minimal, and tool-owned.
+
 ## Relevant JJ Constraints
 
 A few properties of `jj` drive this design:
@@ -44,14 +53,6 @@ A few properties of `jj` drive this design:
   its assumptions narrow and explicit.
 - `jj`'s internal storage is not an extension API. A tool should not write into
   `.jj` internals just because they are available.
-
-## Design Goals
-
-1. Make stacked GitHub PRs feel natural in a `jj` workflow.
-2. Avoid storing parent/base metadata as a source of truth.
-3. Keep branch names stable across rewrite-heavy review.
-4. Recompute as much as possible from `jj` state on every run.
-5. Keep any persisted state optional, minimal, and tool-owned.
 
 ## Proposed Mental Model
 
@@ -239,9 +240,14 @@ Given a selected head revision:
    - otherwise generate the initial default name from subject plus `change_id`
      and persist that choice
 5. Query GitHub for the PR state of those review branches.
+   - if cached linkage and GitHub-discovered linkage disagree, stop and require
+     an explicit recovery flow instead of silently creating a replacement PR
 6. Treat merged ancestors as no longer reviewable. For each remaining change
    from bottom to top:
    - ensure the local bookmark points at the current visible commit for that change
+   - treat topology changes as meaningful updates even when the patch tree is
+     unchanged; if the parent review unit, bookmark target, or PR base changed,
+     this is not a no-op
    - push the bookmark
    - compute the GitHub base branch name:
      - nearest ancestor in the chain whose PR is still open, if any
@@ -254,6 +260,27 @@ Given a selected head revision:
 This bottom-up ordering matches the dependency order in the stack, and the
 parent relationship is derived from the DAG rather than loaded from side
 metadata.
+
+## Recovery and Adoption
+
+The tool should be conservative when review identity is unclear.
+
+If submit cannot prove that a change still corresponds to the same review
+branch and PR, it should fail with a targeted diagnostic instead of guessing.
+In particular, it should not automatically open a new PR just because cached
+linkage, bookmark state, or GitHub state is missing or damaged.
+
+For the MVP, the recovery surface should be explicit and narrow:
+
+- `jj review sync [<revset>]` refreshes local cache from GitHub for already
+  linked review branches and PRs, but does not change stack topology
+- `jj review adopt <pr> [<revset>]` explicitly associates an existing PR and
+  its head branch with a specific `jj` change when the user intends that
+  linkage
+
+These commands are not sources of truth either. They are operator-driven ways
+to reattach GitHub state to a `jj`-derived stack after damage, cross-machine
+work, or manual edits on GitHub.
 
 ## Rewrite Behavior
 
@@ -295,13 +322,16 @@ The tool can stay small. A reasonable surface would be:
 
 - `jj review submit [<revset>]`
 - `jj review status [<revset>]`
+- `jj review sync [<revset>]`
+- `jj review adopt <pr> [<revset>]`
 - `jj review cleanup`
 
 Notably absent:
 
 - no `restack` command, because `jj` already handles descendant rewrites much better than Git
 - no `track parent` command, because the parent relation comes from the DAG
-- no metadata repair command, because there should be almost no metadata to repair
+- no generic metadata repair command, because the recovery cases should stay
+  explicit and narrow
 
 ## Implementation Notes
 
@@ -349,6 +379,22 @@ A GitHub adapter can use either:
 
 If plain `gh` commands that expect a Git repo are used in a non-colocated `jj`
 repo, remember that `GIT_DIR` may need to point at `.jj/repo/store/git`.
+
+### Cleanup Semantics
+
+`jj review cleanup` should have a concrete, conservative job:
+
+- prune cache entries for changes that no longer exist or no longer participate
+  in any review stack
+- remove stale reviewer-facing stack comments that belong to closed or detached
+  PRs
+- optionally delete synthetic remote review branches only when they are clearly
+  stale, such as after the corresponding PR is closed or the change has been
+  abandoned
+
+For the MVP, cleanup should prefer reporting planned actions before mutating
+remote state. Deleting open PRs or deleting review branches for ambiguous cases
+should require explicit user intent rather than happening automatically.
 
 ## Suggested Optional Cache Format
 
