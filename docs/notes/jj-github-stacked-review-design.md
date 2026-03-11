@@ -14,8 +14,9 @@ tool-owned parent map.
 Each reviewable change should get one synthetic bookmark, which acts as the
 GitHub PR head branch.
 
-Local metadata, if any, should be limited to optional GitHub linkage and user
-overrides.
+Local metadata, if any, should be limited to GitHub linkage, user overrides,
+and the pinned bookmark name chosen for a change when the default name includes
+mutable text such as the commit subject.
 
 The result is a tool that behaves like a natural extension of `jj` instead of a
 parallel stack manager.
@@ -105,22 +106,50 @@ The slug is there for reviewers using GitHub or plain Git. The short
 without becoming noisy.
 
 Eight characters is a good default. It is stable, readable, and should be
-effectively unique in practice once combined with the title slug. If a collision
-is ever detected, the tool can extend the suffix or fall back to the full stored
-bookmark name.
+effectively unique in practice once combined with the title slug. If a
+collision is ever detected, the tool can extend the suffix or fall back to the
+full stored bookmark name.
 
-Once a bookmark has been created, the tool should not automatically rename it
-just because the commit title changes later. Title churn should not cause branch
-churn during review.
+The subject slug is only an input to the initial default name. Once a bookmark
+has been created, the tool should not automatically rename it just because the
+commit title changes later. Title churn should not cause branch churn during
+review.
+
+That means bookmark naming is "generate once, then pin", not "recompute forever
+from the current subject". The resolution order should be:
+
+1. explicit user override, if present
+2. previously chosen name discovered from local state, cached review state, or
+   an existing PR for that change
+3. otherwise, generate the initial default from the current subject and
+   `change_id`, then persist that choice
+
+If an implementation wants fully stateless names, it should drop the subject
+slug and derive names only from stable inputs such as `change_id`.
 
 ### Review Base
 
 The GitHub base branch for a review unit is:
 
 - the parent review unit's bookmark, if the parent is also being reviewed
-- otherwise the repo trunk bookmark, resolved from `trunk()`
+- otherwise the repo trunk branch
 
 This is the key place where GitHub still imposes a branch model on top of `jj`.
+
+`trunk()` still defines the stack boundary in commit space, but by itself it
+does not give GitHub a base branch name. For GitHub operations, the tool must
+resolve the trunk base to one concrete remote bookmark on the selected remote,
+such as `main@origin`.
+
+For the MVP, require one of:
+
+- an explicit repo override such as `trunk_branch = "main"`
+- or an unambiguous remote bookmark on the selected remote whose target is
+  `trunk()`
+
+If `trunk()` falls back to `root()` or resolves to a commit that cannot be
+mapped to exactly one remote bookmark on the target remote, submit should fail
+with a configuration error instead of guessing.
 
 ## What Should Be Derived vs Stored
 
@@ -142,12 +171,13 @@ All of that already lives in the commit DAG, the change ID model, and the bookma
 If the tool stores anything locally, it should be limited to:
 
 - optional bookmark-name override for a specific change
-- optional persisted generated bookmark name, if the tool wants to pin the
-  initial readable name even after the title changes
+- pinned generated bookmark name for a specific change, if bookmark names
+  include mutable text such as the subject slug
 - cached PR number and URL
 - last known PR state, only as a cache
 - per-change user preferences such as draft or skip-review
-- repo defaults such as preferred remote or GitHub owner/repo override
+- repo defaults such as preferred remote, trunk branch, or GitHub owner/repo
+  override
 
 Even PR linkage can often be rediscovered by asking GitHub for the PR whose head
 branch matches the synthetic bookmark name.
@@ -168,7 +198,8 @@ For an MVP, use a tool-owned sidecar file such as:
 <workspace-root>/.jj-review.toml
 ```
 
-Treat it as a cache and override file, not the source of truth.
+Treat it as a cache, override file, and bookmark-name pin file, not the source
+of truth for stack topology.
 
 That is not perfect for multi-workspace repos, but it is acceptable because the important state is
 reconstructible. If multi-workspace coherence later matters, add a repo-shared cache once there is
@@ -182,12 +213,23 @@ Given a selected head revision:
    working-copy commit, else `@`.
 2. Walk parents back toward `trunk()`, building a linear chain of visible mutable changes.
 3. Reject ambiguous shapes instead of inventing metadata to patch around them.
-4. For each change from bottom to top:
-   - compute the deterministic bookmark name
+4. Resolve each change's review bookmark by reuse-first, generation-second:
+   - explicit override, if present
+   - otherwise previously chosen local or cached name, or the head branch of an
+     existing PR for that change
+   - otherwise generate the initial default name from subject plus `change_id`
+     and persist that choice
+5. Query GitHub for the PR state of those review branches.
+6. Treat merged ancestors as no longer reviewable. For each remaining change
+   from bottom to top:
    - ensure the local bookmark points at the current visible commit for that change
-   - ensure the bookmark is tracked on the chosen remote
    - push the bookmark
-   - compute the GitHub base branch name
+   - compute the GitHub base branch name:
+     - nearest ancestor in the chain whose PR is still open, if any
+     - otherwise the resolved trunk branch
+   - if an ancestor PR has merged and the local `jj` parentage still reflects
+     the old review stack, require a local `jj rebase` before changing the PR
+     base
    - create or update the PR for `head bookmark -> base bookmark`
 
 This bottom-up ordering matches the dependency order in the stack, and the
@@ -206,6 +248,10 @@ This design behaves well under normal `jj` rewrite-heavy workflows:
   leave it open with a warning, or mark it stale.
 - Split: new logical review units get new change IDs, which should usually
   become new PRs. This is a feature, not a bug.
+- Ancestor merged on GitHub: merged ancestors stop acting as review bases.
+  Descendants should target the nearest remaining open ancestor PR, or trunk if
+  none remain. For the MVP, the tool should require a matching local `jj`
+  rebase before it updates child PR bases.
 
 This is exactly the kind of rewrite-heavy flow the `jj` model is good at.
 
@@ -292,6 +338,7 @@ If a cache file exists, keep it sparse:
 ```toml
 version = 1
 remote = "origin"
+trunk_branch = "main"
 
 [change."<full-change-id>"]
 bookmark = "review/alice/fix-cache-invalidation-ypvmkkuo"
@@ -303,9 +350,11 @@ skip = false
 
 Semantics:
 
-- missing entry means "derive everything"
-- present entry means "apply override or use cached GitHub lookup"
-- deleting the file must never break the review stack model
+- missing entry means "reuse any discoverable bookmark or PR state, otherwise
+  generate defaults"
+- present entry means "apply override or reuse cached GitHub linkage"
+- deleting the file must never break the review stack model, though it may
+  force rediscovery or manual reattachment of review bookmarks
 
 ## MVP Boundary
 
@@ -329,8 +378,6 @@ The MVP should intentionally reject:
 1. Should the default bookmark namespace include the user name, or only the change ID?
 2. Should the tool derive PR titles from commit subject, full description, or a template?
 3. Should abandoned or split PRs be auto-closed, or only surfaced as cleanup suggestions?
-4. When part of a stack is already merged, should child PRs rebase onto the nearest submitted
-   ancestor bookmark or jump directly to trunk?
 
 ## Bottom Line
 
