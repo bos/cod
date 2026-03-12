@@ -14,5 +14,6 @@
 - Run `./check.py` for the default local Ruff, type-check, and test pass before
   finishing a change.
 - If behavior changes, update the docs in the same change and make sure tests pass.
+- Once a slice is implemented, update the implementation doc to note this.
 - Hard-wrap new prose at 96-98 columns unless the file uses a different
   convention.

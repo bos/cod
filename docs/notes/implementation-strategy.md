@@ -432,6 +432,8 @@ We should implement the MVP in vertical slices.
 
 ### Slice 1: Project Scaffold
 
+Status: complete.
+
 Deliver:
 
 - `uv` project setup
@@ -446,6 +448,8 @@ Done when:
 - a trivial fake-server integration test passes
 
 ### Slice 2: Local Stack Discovery
+
+Status: complete.
 
 Deliver:
 
