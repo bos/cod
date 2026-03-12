@@ -1,0 +1,140 @@
+"""CLI entrypoint for the standalone `jj-review` executable."""
+
+from __future__ import annotations
+
+import logging
+import sys
+from argparse import ArgumentParser, Namespace, _SubParsersAction
+from collections.abc import Sequence
+from pathlib import Path
+
+from jj_review import __version__
+from jj_review.bootstrap import BootstrapError, bootstrap_context
+
+logger = logging.getLogger(__name__)
+
+
+class CliError(RuntimeError):
+    """Base error for user-facing CLI failures."""
+
+    exit_code = 1
+
+
+class CommandNotImplementedError(CliError):
+    """Raised for stubbed commands that are not implemented yet."""
+
+    exit_code = 2
+
+    def __init__(self, command: str) -> None:
+        super().__init__(f"`{command}` is not implemented yet.")
+
+
+def build_parser() -> ArgumentParser:
+    """Build the top-level CLI parser and subcommands."""
+
+    parser = ArgumentParser(
+        prog="jj-review",
+        description="JJ-native stacked GitHub review tooling.",
+    )
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        help="Workspace path to operate on. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Explicit path to a TOML config file.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+    _add_revision_command(
+        subparsers,
+        command="submit",
+        help_text="Project a local jj stack onto GitHub pull requests.",
+    )
+    _add_revision_command(
+        subparsers,
+        command="status",
+        help_text="Show cached and remote review state for a stack.",
+    )
+    _add_revision_command(
+        subparsers,
+        command="sync",
+        help_text="Refresh cached review linkage from GitHub.",
+    )
+
+    adopt_parser = subparsers.add_parser(
+        "adopt",
+        help="Associate an existing pull request with a local change.",
+    )
+    adopt_parser.add_argument("pull_request", help="Pull request number or URL.")
+    adopt_parser.add_argument(
+        "revset",
+        nargs="?",
+        help="Revision to associate with the pull request.",
+    )
+    adopt_parser.set_defaults(handler=_stub_handler("adopt"))
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="Report or apply conservative review cleanup actions.",
+    )
+    cleanup_parser.set_defaults(handler=_stub_handler("cleanup"))
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI and return a process exit code."""
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        parser.print_help()
+        return 0
+
+    try:
+        return handler(args)
+    except (BootstrapError, CliError) as error:
+        print(error, file=sys.stderr)
+        return error.exit_code
+
+
+def _add_revision_command(
+    subparsers: _SubParsersAction[ArgumentParser],
+    *,
+    command: str,
+    help_text: str,
+) -> None:
+    parser = subparsers.add_parser(command, help=help_text)
+    parser.add_argument("revset", nargs="?", help="Revision to operate on.")
+    parser.set_defaults(handler=_stub_handler(command))
+
+
+def _stub_handler(command: str):
+    def handler(args: Namespace) -> int:
+        context = bootstrap_context(args)
+        logger.debug(
+            "bootstrapped %s in %s with config %s",
+            command,
+            context.repo_root,
+            context.options.config_path,
+        )
+        raise CommandNotImplementedError(command)
+
+    return handler
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -91,17 +91,25 @@ stable.
 The tool itself should ship as a standalone executable, for example
 `jj-review`.
 
+During development inside this repo, the default invocation should be:
+
+```text
+uv run jj-review ...
+```
+
 Users may also configure `jj` aliases that delegate to the standalone
 executable so that `jj review ...` works ergonomically. That alias layer should
 be treated as convenience glue, not as a separate implementation surface.
+
+For development workflows, the package may also be invoked as
+`python -m jj_review`, but `uv run jj-review` should be the primary path.
 
 Tests and packaging should target the standalone executable directly. Any `jj`
 alias integration should stay thin and optional.
 
 ## Proposed Repository Layout
 
-The repository is currently docs-only, so the implementation can choose a clean
-layout.
+Slice 1 establishes the initial scaffold using a clean layout.
 
 Proposed shape:
 
@@ -146,6 +154,10 @@ The CLI layer should be thin. It should:
 - render user-facing output and diagnostics
 
 It should not contain stack planning logic.
+
+Bootstrap failures such as missing config files, invalid config syntax, or bad
+local paths should be surfaced as targeted CLI diagnostics rather than Python
+tracebacks.
 
 ### JJ Adapter
 
@@ -268,6 +280,7 @@ The implementation should standardize on:
 - `uv` for environment and dependency management
 - `uv run` for local command execution
 - `uv tool run` only where it clearly improves ergonomics
+- `./check.py` as the default local verification entrypoint
 - `ty` for static type checking
 - `ruff` for linting and formatting
 - `pytest` for the test runner
@@ -291,6 +304,15 @@ We should have three layers of tests:
 - opt-in live tests against a genuine GitHub repository
 
 Local tests should be the default.
+
+The default local verification command should be:
+
+```text
+./check.py
+```
+
+That script should run `uv sync --locked`, then run `ruff check`, `ty check`,
+and `pytest` in sequence.
 
 Live tests should require an explicit flag and explicit credentials.
 
@@ -420,8 +442,7 @@ Deliver:
 
 Done when:
 
-- `uv run pytest` works locally
-- `uv run ty check` works locally
+- `./check.py` works locally
 - a trivial fake-server integration test passes
 
 ### Slice 2: Local Stack Discovery
