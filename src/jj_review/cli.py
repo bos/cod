@@ -10,23 +10,10 @@ from pathlib import Path
 
 from jj_review import __version__
 from jj_review.bootstrap import BootstrapError, bootstrap_context
+from jj_review.errors import CliError, CommandNotImplementedError
+from jj_review.jj import JjClient
 
 logger = logging.getLogger(__name__)
-
-
-class CliError(RuntimeError):
-    """Base error for user-facing CLI failures."""
-
-    exit_code = 1
-
-
-class CommandNotImplementedError(CliError):
-    """Raised for stubbed commands that are not implemented yet."""
-
-    exit_code = 2
-
-    def __init__(self, command: str) -> None:
-        super().__init__(f"`{command}` is not implemented yet.")
 
 
 def build_parser() -> ArgumentParser:
@@ -67,6 +54,7 @@ def build_parser() -> ArgumentParser:
         subparsers,
         command="status",
         help_text="Show cached and remote review state for a stack.",
+        handler=_status_handler,
     )
     _add_revision_command(
         subparsers,
@@ -116,10 +104,26 @@ def _add_revision_command(
     *,
     command: str,
     help_text: str,
+    handler=None,
 ) -> None:
     parser = subparsers.add_parser(command, help=help_text)
     parser.add_argument("revset", nargs="?", help="Revision to operate on.")
-    parser.set_defaults(handler=_stub_handler(command))
+    parser.set_defaults(handler=handler or _stub_handler(command))
+
+
+def _status_handler(args: Namespace) -> int:
+    context = bootstrap_context(args)
+    stack = JjClient(context.repo_root).discover_review_stack(args.revset)
+    print(f"Selected revset: {stack.selected_revset}")
+    print(f"Trunk: {stack.trunk.subject} [{stack.trunk.change_id[:12]}]")
+    if not stack.revisions:
+        print("No reviewable commits between the selected revision and `trunk()`.")
+        return 0
+
+    print("Stack:")
+    for revision in stack.revisions:
+        print(f"- {revision.subject} [{revision.change_id[:12]}]")
+    return 0
 
 
 def _stub_handler(command: str):

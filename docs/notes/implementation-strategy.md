@@ -452,6 +452,8 @@ Deliver:
 - typed `jj` command wrapper
 - linear stack discovery from a selected head back to `trunk()`
 - rejection of unsupported graph shapes
+- fail-closed handling for `trunk()` resolving to `root()`
+- rejection of immutable revisions while walking the stack
 
 Done when:
 
