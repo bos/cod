@@ -11,6 +11,21 @@ commits.
 Anything marked `XXX` is not fully cooked yet and should be treated as a draft
 decision or an open question.
 
+## Relationship to the Design Doc
+
+[JJ-Native Stacked GitHub Review Design](./design.md) is the canonical source
+for product behavior and policy, including:
+
+- the review-unit and stack model
+- bookmark naming and cache semantics
+- submit, sync, adopt, and cleanup behavior
+- MVP command surface and scope
+- fail-closed behavior when review identity is ambiguous
+
+This document focuses on implementation choices that follow from that design:
+repository layout, component boundaries, tooling, test strategy, and delivery
+sequencing.
+
 ## Summary
 
 We will build a Python client that projects a `jj` stack onto GitHub's
@@ -43,29 +58,14 @@ logical, self-contained, well-described stacked commits.
 
 ## Non-Goals
 
-The MVP will not attempt to solve every forge workflow problem.
+Product-level MVP scope follows the design doc. Additional implementation
+non-goals for the first pass:
 
-Out of scope for the initial implementation:
-
-- merge-commit review stacks
-- multiple remotes or cross-repo stacks
 - support for non-GitHub forges
 - a daemon or long-running background sync process
 - a GUI or web UI
 
 Reviewer and label assignment are in scope for PR creation and update flows.
-
-## Core Invariants
-
-These rules should constrain both the implementation and the tests:
-
-- The `jj` DAG is the source of truth for stack topology.
-- GitHub state is projected state, not authoritative topology state.
-- Reviewer-facing stack metadata in PR comments is presentation only.
-- The tool must fail closed when review identity is ambiguous.
-- The tool must not silently create replacement PRs when linkage is damaged.
-- Topology changes are meaningful even when patch content is unchanged.
-- Real GitHub behavior wins when the fake GitHub server and GitHub disagree.
 
 ## Implementation Model
 
@@ -81,17 +81,12 @@ At a high level, each command should follow the same shape:
 We should keep the code separated along those boundaries so that planning logic
 can be tested without network or subprocess side effects.
 
-## Expected Command Surface
+## Executable Surface
 
-The initial MVP command surface should track the design doc:
+The product command surface should follow the design doc.
 
-- `jj review submit [<revset>]`
-- `jj review status [<revset>]`
-- `jj review sync [<revset>]`
-- `jj review adopt <pr> [<revset>]`
-- `jj review cleanup`
-
-`land` is explicitly deferred until after the initial review lifecycle is stable.
+`land` is explicitly deferred until after the initial review lifecycle is
+stable.
 
 The tool itself should ship as a standalone executable, for example
 `jj-review`.
@@ -205,10 +200,9 @@ It should not decide stack topology or branch naming policy.
 
 ### Local Cache
 
-The local cache should be sparse and versioned. It exists to pin otherwise
-mutable names and to remember discovered GitHub identifiers.
-
-It must not become a second topology source.
+The design doc defines the local cache as minimal, optional, and
+non-authoritative. The implementation should model it as a sparse, versioned
+sidecar with typed persistence.
 
 ## Data Model
 
@@ -223,11 +217,11 @@ Important model families:
 - mutation plan models
 - cache file models
 
-Important persisted records:
+Important persisted records should mirror the design doc's minimal review-state
+cache:
 
-- repo defaults such as selected remote and trunk branch
-- per-change pinned bookmark name
-- per-change PR number and URL
+- repo defaults used for resolution
+- per-change pinned bookmark and GitHub linkage
 - per-change reviewer-facing stack comment identifier, if used
 
 Command output and planning results should use first-class typed models.
@@ -238,7 +232,8 @@ dicts or stringly typed intermediate state through the command layer.
 
 For the MVP, the common case should be zero-config. The tool should prefer
 repo-derived defaults and only require explicit configuration when the repo is
-ambiguous.
+ambiguous. This section extends the design doc's trunk-resolution requirement
+into a full repository-resolution order.
 
 The resolution order should be:
 
@@ -535,6 +530,10 @@ product surface.
 
 Errors should be explicit and actionable.
 
+The user-visible fail-closed cases are defined in the design doc. The
+implementation should classify them cleanly and surface targeted recovery
+actions.
+
 We should distinguish between:
 
 - user/actionable errors
@@ -542,13 +541,6 @@ We should distinguish between:
 - remote state conflicts
 - fake-server parity failures
 - tool bugs
-
-Examples of required hard-stop behavior:
-
-- cache says PR A, GitHub linkage says PR B
-- `trunk()` cannot be mapped to one concrete remote branch
-- part of the stack is merged and local `jj` parentage has not been rebased yet
-- user asks to update a stack with unsupported graph shape
 
 When possible, diagnostics should point to the exact recovery action:
 
