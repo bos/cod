@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import pytest
 
+from jj_review.bookmarks import ResolvedBookmark
 from jj_review.commands.submit import (
+    SubmitBookmarkCollisionError,
     SubmitRemoteResolutionError,
+    _ensure_unique_bookmarks,
+    _remote_is_up_to_date,
     select_submit_remote,
 )
 from jj_review.config import RepoConfig
-from jj_review.models.bookmarks import GitRemote
+from jj_review.models.bookmarks import GitRemote, RemoteBookmarkState
 
 
 def test_select_submit_remote_prefers_configured_remote() -> None:
@@ -63,3 +67,34 @@ def test_select_submit_remote_rejects_ambiguous_remote_set_without_origin() -> N
                 GitRemote(name="upstream", url="git@example.com:org/repo.git"),
             ),
         )
+
+
+def test_remote_is_up_to_date_when_untracked_remote_target_matches() -> None:
+    remote_state = RemoteBookmarkState(
+        remote="origin",
+        targets=("abc123",),
+        tracking_targets=(),
+    )
+
+    assert _remote_is_up_to_date(remote_state, "abc123") is True
+
+
+def test_ensure_unique_bookmarks_rejects_duplicate_names() -> None:
+    resolutions = (
+        ResolvedBookmark(
+            bookmark="review/shared-name",
+            change_id="change-a",
+            source="override",
+        ),
+        ResolvedBookmark(
+            bookmark="review/shared-name",
+            change_id="change-b",
+            source="cache",
+        ),
+    )
+
+    with pytest.raises(
+        SubmitBookmarkCollisionError,
+        match="multiple review units to the same bookmark",
+    ):
+        _ensure_unique_bookmarks(resolutions)

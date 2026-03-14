@@ -167,7 +167,7 @@ operations such as:
 - resolve a revset
 - inspect the working-copy/default submit target
 - enumerate the linear review chain
-- read bookmarks and tracked remote bookmark state
+- read bookmarks plus tracked and untracked remote bookmark state
 
 The adapter should prefer machine-readable template output over parsing human
 text.
@@ -535,7 +535,8 @@ Deliver:
 Done when:
 
 - tests assert on the backing Git repo after client actions
-- no-op detection respects topology changes as well as content changes
+- no-op detection respects topology changes as well as content changes,
+  including matching untracked remote bookmarks
 
 ### Slice 5: PR Create and Update
 

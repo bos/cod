@@ -84,6 +84,42 @@ def test_submit_updates_remote_bookmark_after_change_rewrite(
     assert _read_remote_ref(remote, initial_bookmark) == rewritten_stack.revisions[-1].commit_id
 
 
+def test_submit_rejects_duplicate_bookmark_overrides_before_projection(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    repo, remote = _init_repo(tmp_path)
+    _commit(repo, "feature 1", "feature-1.txt")
+    _commit(repo, "feature 2", "feature-2.txt")
+    stack = JjClient(repo).discover_review_stack()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'[change."{stack.revisions[0].change_id}"]',
+                'bookmark_override = "review/same"',
+                "",
+                f'[change."{stack.revisions[1].change_id}"]',
+                'bookmark_override = "review/same"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        ["--config", str(config_path), "--repository", str(repo), "submit"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "multiple review units to the same bookmark" in captured.err
+    assert ReviewStateStore.for_repo(repo).load().changes == {}
+    assert _remote_refs(remote) == {}
+
+
 def _init_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo = tmp_path / "repo"
     fake_repo = initialize_bare_repository(
@@ -116,7 +152,19 @@ def _read_remote_ref(remote: Path, bookmark: str) -> str:
 
 
 def _remote_refs(remote: Path) -> dict[str, str]:
-    completed = _run(["git", "--git-dir", str(remote), "show-ref", "--heads"], remote.parent)
+    completed = subprocess.run(
+        ["git", "--git-dir", str(remote), "show-ref", "--heads"],
+        capture_output=True,
+        check=False,
+        cwd=remote.parent,
+        text=True,
+    )
+    if completed.returncode not in (0, 1):
+        raise AssertionError(
+            "['git', '--git-dir', "
+            f"{str(remote)!r}, 'show-ref', '--heads'] failed:\n"
+            f"stdout={completed.stdout}\nstderr={completed.stderr}"
+        )
     refs: dict[str, str] = {}
     for line in completed.stdout.splitlines():
         commit_id, ref_name = line.split(" ", maxsplit=1)

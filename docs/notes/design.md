@@ -261,6 +261,8 @@ Given a selected head revision:
      existing PR for that change
    - otherwise generate the initial default name from subject plus `change_id`
      and persist that choice
+   - if two selected changes resolve to the same bookmark name, fail closed
+     before mutating local or remote state
 5. Query GitHub for the PR state of those review branches.
    - if cached linkage and GitHub-discovered linkage disagree, stop and require
      an explicit recovery flow instead of silently creating a replacement PR
@@ -270,7 +272,9 @@ Given a selected head revision:
    - treat topology changes as meaningful updates even when the patch tree is
      unchanged; if the parent review unit, bookmark target, or PR base changed,
      this is not a no-op
-   - push the bookmark
+   - if the selected remote bookmark already points at the desired commit, treat
+     it as up to date even when the local repo has not tracked that remote
+     bookmark yet; otherwise push the bookmark
    - compute the GitHub base branch name:
      - nearest ancestor in the chain whose PR is still open, if any
      - otherwise the resolved trunk branch
