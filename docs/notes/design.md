@@ -299,6 +299,9 @@ Given a selected head revision:
 5. Query GitHub for the PR state of those review branches.
    - if cached linkage and GitHub-discovered linkage disagree, stop and require
      an explicit recovery flow instead of silently creating a replacement PR
+   - for the MVP, derive the PR title from the commit subject and the PR body
+     from the remaining commit description; generated stack metadata is added
+     later and is not part of this slice
 6. Treat merged ancestors as no longer reviewable. For each remaining change
    from bottom to top:
    - ensure the local bookmark points at the current visible commit for that change
@@ -523,8 +526,10 @@ The MVP should intentionally reject:
 
 ## Open Questions
 
-1. Should the tool derive PR titles from commit subject, full description, or a template?
-2. Should abandoned or split PRs be auto-closed, or only surfaced as cleanup suggestions?
+1. Should the tool eventually support PR title/body templates beyond the raw
+   commit description mapping used for the MVP?
+2. Should abandoned or split PRs be auto-closed, or only surfaced as cleanup
+   suggestions?
 
 ## Bottom Line
 

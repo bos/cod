@@ -3,10 +3,18 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import httpx
+
 from jj_review.cache import ReviewStateStore
 from jj_review.cli import main
+from jj_review.github.client import GithubClient
 from jj_review.jj import JjClient
-from jj_review.testing.fake_github import initialize_bare_repository
+from jj_review.testing.fake_github import (
+    FakeGithubRepository,
+    FakeGithubState,
+    create_app,
+    initialize_bare_repository,
+)
 
 
 def test_submit_projects_review_bookmarks_to_selected_remote(
@@ -14,74 +22,105 @@ def test_submit_projects_review_bookmarks_to_selected_remote(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
     _commit(repo, "feature 1", "feature-1.txt")
     _commit(repo, "feature 2", "feature-2.txt")
 
-    exit_code = main(["--repository", str(repo), "submit"])
+    exit_code = _main(repo, config_path, "submit")
     captured = capsys.readouterr()
     stack = JjClient(repo).discover_review_stack()
     state = ReviewStateStore.for_repo(repo).load()
+    first_bookmark = state.changes[stack.revisions[0].change_id].bookmark
 
     assert exit_code == 0
     assert "Selected remote: origin" in captured.out
-    for revision in stack.revisions:
-        bookmark = state.changes[revision.change_id].bookmark
+    assert "Trunk: base -> main" in captured.out
+    assert len(fake_repo.pull_requests) == 2
+    for index, revision in enumerate(stack.revisions, start=1):
+        cached_change = state.changes[revision.change_id]
+        bookmark = cached_change.bookmark
         assert bookmark is not None
-        assert _read_remote_ref(remote, bookmark) == revision.commit_id
+        assert cached_change.pr_number == index
+        assert cached_change.pr_url == fake_repo.pull_requests[index].to_payload(
+            repository=fake_repo,
+            web_origin="https://github.test",
+        )["html_url"]
+        assert _read_remote_ref(fake_repo.git_dir, bookmark) == revision.commit_id
+
+    assert fake_repo.pull_requests[1].base_ref == "main"
+    assert fake_repo.pull_requests[2].base_ref == first_bookmark
 
 
-def test_submit_reports_up_to_date_when_remote_bookmark_already_matches(
+def test_submit_reports_up_to_date_when_remote_bookmark_and_pr_already_match(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
     _commit(repo, "feature 1", "feature-1.txt")
 
-    assert main(["--repository", str(repo), "submit"]) == 0
+    assert _main(repo, config_path, "submit") == 0
     first_output = capsys.readouterr().out
-    first_refs = _remote_refs(remote)
+    first_refs = _remote_refs(fake_repo.git_dir)
+    first_prs = {
+        number: pull_request.title
+        for number, pull_request in fake_repo.pull_requests.items()
+    }
 
-    exit_code = main(["--repository", str(repo), "submit"])
+    exit_code = _main(repo, config_path, "submit")
     captured = capsys.readouterr()
 
     assert exit_code == 0
     assert "pushed" in first_output
     assert "up to date" in captured.out
-    assert _remote_refs(remote) == first_refs
+    assert "unchanged" in captured.out
+    assert _remote_refs(fake_repo.git_dir) == first_refs
+    assert {number: pr.title for number, pr in fake_repo.pull_requests.items()} == first_prs
 
 
-def test_submit_updates_remote_bookmark_after_change_rewrite(
+def test_submit_updates_existing_pull_request_after_change_rewrite(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
     _commit(repo, "feature 1", "feature-1.txt")
-    _commit(repo, "feature 2", "feature-2.txt")
-    assert main(["--repository", str(repo), "submit"]) == 0
+    _write_file(repo / "feature-2.txt", "feature 2\n")
+    _write_file(repo / "details.txt", "more detail\n")
+    _run(["jj", "commit", "-m", "feature 2\n\nbody line"], repo)
+    assert _main(repo, config_path, "submit") == 0
     capsys.readouterr()
 
     first_stack = JjClient(repo).discover_review_stack()
     top_change_id = first_stack.revisions[-1].change_id
     initial_bookmark = ReviewStateStore.for_repo(repo).load().changes[top_change_id].bookmark
     assert initial_bookmark is not None
+    initial_pr_number = ReviewStateStore.for_repo(repo).load().changes[top_change_id].pr_number
+    assert initial_pr_number is not None
 
-    _run(["jj", "describe", "-r", top_change_id, "-m", "feature 2 renamed"], repo)
+    _run(
+        ["jj", "describe", "-r", top_change_id, "-m", "feature 2 renamed\n\nupdated body"],
+        repo,
+    )
 
-    exit_code = main(["--repository", str(repo), "submit", top_change_id])
+    exit_code = _main(repo, config_path, "submit", top_change_id)
     captured = capsys.readouterr()
     rewritten_stack = JjClient(repo).discover_review_stack(top_change_id)
-    rewritten_bookmark = ReviewStateStore.for_repo(repo).load().changes[top_change_id].bookmark
+    rewritten_state = ReviewStateStore.for_repo(repo).load()
+    rewritten_bookmark = rewritten_state.changes[top_change_id].bookmark
 
     assert exit_code == 0
     assert rewritten_bookmark == initial_bookmark
-    assert "pushed" in captured.out
-    assert _read_remote_ref(remote, initial_bookmark) == rewritten_stack.revisions[-1].commit_id
+    assert "updated" in captured.out
+    assert (
+        _read_remote_ref(fake_repo.git_dir, initial_bookmark)
+        == rewritten_stack.revisions[-1].commit_id
+    )
+    assert fake_repo.pull_requests[initial_pr_number].title == "feature 2 renamed"
+    assert fake_repo.pull_requests[initial_pr_number].body == "updated body"
 
 
 def test_submit_updates_existing_untracked_remote_bookmark(
@@ -89,28 +128,28 @@ def test_submit_updates_existing_untracked_remote_bookmark(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
     _commit(repo, "feature 1", "feature-1.txt")
 
-    assert main(["--repository", str(repo), "submit"]) == 0
+    assert _main(repo, config_path, "submit") == 0
     capsys.readouterr()
 
     stack = JjClient(repo).discover_review_stack()
     change_id = stack.revisions[-1].change_id
-    bookmark = ReviewStateStore.for_repo(repo).load().changes[change_id].bookmark
+    cached_change = ReviewStateStore.for_repo(repo).load().changes[change_id]
+    bookmark = cached_change.bookmark
+    pr_number = cached_change.pr_number
     assert bookmark is not None
+    assert pr_number is not None
 
     _run(["jj", "bookmark", "forget", bookmark], repo)
-    # Forgetting the local bookmark leaves only an untracked remote bookmark, which makes
-    # the old commit immutable in jj. Rewrite it explicitly so the test can exercise the
-    # resubmit path instead of the immutability guard.
     _run(
         ["jj", "describe", "--ignore-immutable", "-r", change_id, "-m", "feature 1 renamed"],
         repo,
     )
 
-    exit_code = main(["--repository", str(repo), "submit", change_id])
+    exit_code = _main(repo, config_path, "submit", change_id)
     captured = capsys.readouterr()
     rewritten_stack = JjClient(repo).discover_review_stack(change_id)
     bookmark_state = JjClient(repo).get_bookmark_state(bookmark)
@@ -118,9 +157,13 @@ def test_submit_updates_existing_untracked_remote_bookmark(
 
     assert exit_code == 0
     assert "pushed" in captured.out
-    assert _read_remote_ref(remote, bookmark) == rewritten_stack.revisions[-1].commit_id
+    assert (
+        _read_remote_ref(fake_repo.git_dir, bookmark)
+        == rewritten_stack.revisions[-1].commit_id
+    )
     assert remote_state is not None
     assert remote_state.is_tracked is True
+    assert fake_repo.pull_requests[pr_number].title == "feature 1 renamed"
 
 
 def test_submit_reports_no_reviewable_commits_when_head_is_trunk(
@@ -128,17 +171,18 @@ def test_submit_reports_no_reviewable_commits_when_head_is_trunk(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, _remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
 
-    # main itself is trunk(); selecting it means there is nothing to review.
-    exit_code = main(["--repository", str(repo), "submit", "main"])
+    exit_code = _main(repo, config_path, "submit", "main")
     captured = capsys.readouterr()
 
     assert exit_code == 0
+    assert "Trunk: base -> main" in captured.out
     assert "No reviewable commits" in captured.out
-    # Nothing should have been persisted or pushed.
     assert ReviewStateStore.for_repo(repo).load().changes == {}
+    assert set(_remote_refs(fake_repo.git_dir)) == {"refs/heads/main"}
+    assert fake_repo.pull_requests == {}
 
 
 def test_submit_rejects_duplicate_bookmark_overrides_before_projection(
@@ -146,24 +190,21 @@ def test_submit_rejects_duplicate_bookmark_overrides_before_projection(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
-    repo, remote = _init_repo(tmp_path)
+    repo, fake_repo = _init_repo(tmp_path)
+    _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
     _commit(repo, "feature 1", "feature-1.txt")
     _commit(repo, "feature 2", "feature-2.txt")
     stack = JjClient(repo).discover_review_stack()
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        "\n".join(
-            [
-                f'[change."{stack.revisions[0].change_id}"]',
-                'bookmark_override = "review/same"',
-                "",
-                f'[change."{stack.revisions[1].change_id}"]',
-                'bookmark_override = "review/same"',
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    config_path = _write_config(
+        tmp_path,
+        fake_repo,
+        extra_lines=[
+            f'[change."{stack.revisions[0].change_id}"]',
+            'bookmark_override = "review/same"',
+            "",
+            f'[change."{stack.revisions[1].change_id}"]',
+            'bookmark_override = "review/same"',
+        ],
     )
 
     exit_code = main(["--config", str(config_path), "--repository", str(repo), "submit"])
@@ -172,10 +213,30 @@ def test_submit_rejects_duplicate_bookmark_overrides_before_projection(
     assert exit_code == 1
     assert "multiple review units to the same bookmark" in captured.err
     assert ReviewStateStore.for_repo(repo).load().changes == {}
-    assert _remote_refs(remote) == {}
+    assert set(_remote_refs(fake_repo.git_dir)) == {"refs/heads/main"}
+    assert fake_repo.pull_requests == {}
 
 
-def _init_repo(tmp_path: Path) -> tuple[Path, Path]:
+def _configure_submit_environment(
+    monkeypatch,
+    tmp_path: Path,
+    fake_repo: FakeGithubRepository,
+) -> Path:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    config_path = _write_config(tmp_path, fake_repo)
+    app = create_app(FakeGithubState.single_repository(fake_repo))
+
+    def build_github_client(*, base_url: str) -> GithubClient:
+        return GithubClient(
+            base_url=base_url,
+            transport=httpx.ASGITransport(app=app),
+        )
+
+    monkeypatch.setattr("jj_review.commands.submit._build_github_client", build_github_client)
+    return config_path
+
+
+def _init_repo(tmp_path: Path) -> tuple[Path, FakeGithubRepository]:
     repo = tmp_path / "repo"
     fake_repo = initialize_bare_repository(
         tmp_path / "remotes",
@@ -190,7 +251,8 @@ def _init_repo(tmp_path: Path) -> tuple[Path, Path]:
     _run(["jj", "bookmark", "create", "main", "-r", "@-"], repo)
     _run(["jj", "config", "set", "--repo", 'revset-aliases."trunk()"', "main"], repo)
     _run(["jj", "git", "remote", "add", "origin", str(fake_repo.git_dir)], repo)
-    return repo, fake_repo.git_dir
+    _run(["jj", "git", "push", "--remote", "origin", "--bookmark", "main"], repo)
+    return repo, fake_repo
 
 
 def _commit(repo: Path, message: str, filename: str) -> None:
@@ -242,5 +304,34 @@ def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return completed
 
 
+def _main(repo: Path, config_path: Path, command: str, revset: str | None = None) -> int:
+    argv = ["--config", str(config_path), "--repository", str(repo), command]
+    if revset is not None:
+        argv.append(revset)
+    return main(argv)
+
+
+def _write_config(
+    tmp_path: Path,
+    fake_repo: FakeGithubRepository,
+    *,
+    extra_lines: list[str] | None = None,
+) -> Path:
+    config_path = tmp_path / "config-home" / "jj-review" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "[repo]",
+        'github_host = "github.test"',
+        f'github_owner = "{fake_repo.owner}"',
+        f'github_repo = "{fake_repo.name}"',
+    ]
+    if extra_lines:
+        lines.append("")
+        lines.extend(extra_lines)
+    _write_file(config_path, "\n".join(lines) + "\n")
+    return config_path
+
+
 def _write_file(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(contents, encoding="utf-8")

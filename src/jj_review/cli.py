@@ -154,7 +154,7 @@ def _submit_handler(args: Namespace) -> int:
     )
     print(f"Selected revset: {result.selected_revset}")
     print(f"Selected remote: {result.remote.name}")
-    print(f"Trunk: {result.trunk_subject}")
+    print(f"Trunk: {result.trunk_subject} -> {result.trunk_branch}")
     if not result.revisions:
         print("No reviewable commits between the selected revision and `trunk()`.")
         return 0
@@ -163,7 +163,8 @@ def _submit_handler(args: Namespace) -> int:
     for revision in result.revisions:
         print(
             f"- {revision.subject} [{revision.change_id[:12]}] -> {revision.bookmark} "
-            f"({revision.bookmark_source}, {revision.remote_action})"
+            f"({revision.bookmark_source}, {revision.remote_action}, "
+            f"PR #{revision.pull_request_number} {revision.pull_request_action})"
         )
     return 0
 

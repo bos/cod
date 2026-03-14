@@ -549,13 +549,18 @@ Done when:
 
 ### Slice 5: PR Create and Update
 
+Status: core complete.
+
 Deliver:
 
 - PR lookup
 - PR creation
 - PR updates
-- reviewer and label assignment
 - trunk branch resolution
+
+Deferred pending config/design work:
+
+- reviewer and label assignment
 
 Done when:
 

@@ -1,25 +1,33 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from jj_review.bookmarks import ResolvedBookmark
 from jj_review.commands.submit import (
     SubmitBookmarkCollisionError,
     SubmitBookmarkConflictError,
+    SubmitGithubResolutionError,
+    SubmitPullRequestResolutionError,
     SubmitRemoteBookmarkConflictError,
     SubmitRemoteBookmarkOwnershipError,
     SubmitRemoteResolutionError,
     _bookmark_linkage_is_proven,
+    _ensure_pull_request_linkage_is_consistent,
     _ensure_remote_can_be_updated,
     _ensure_unique_bookmarks,
     _remote_is_up_to_date,
     _resolve_local_action,
     _should_update_untracked_remote_with_git,
+    resolve_github_repository,
+    resolve_trunk_branch,
     select_submit_remote,
 )
 from jj_review.config import RepoConfig
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
+from jj_review.models.github import GithubBranchRef, GithubPullRequest, GithubRepository
 
 
 def test_select_submit_remote_prefers_configured_remote() -> None:
@@ -83,6 +91,118 @@ def test_select_submit_remote_rejects_empty_remote_list() -> None:
         match="Could not determine which Git remote to use for submit",
     ):
         select_submit_remote(RepoConfig(), ())
+
+
+def test_resolve_github_repository_prefers_configured_values() -> None:
+    repository = resolve_github_repository(
+        RepoConfig(
+            github_host="github.test",
+            github_owner="octo-org",
+            github_repo="stacked-review",
+        ),
+        GitRemote(name="origin", url="/tmp/remote.git"),
+    )
+
+    assert repository.host == "github.test"
+    assert repository.owner == "octo-org"
+    assert repository.repo == "stacked-review"
+
+
+def test_resolve_github_repository_parses_https_remote_url() -> None:
+    repository = resolve_github_repository(
+        RepoConfig(),
+        GitRemote(
+            name="origin",
+            url="https://github.test/octo-org/stacked-review.git",
+        ),
+    )
+
+    assert repository.host == "github.test"
+    assert repository.owner == "octo-org"
+    assert repository.repo == "stacked-review"
+
+
+def test_resolve_github_repository_rejects_unparseable_remote_without_config() -> None:
+    with pytest.raises(
+        SubmitGithubResolutionError,
+        match="Could not determine the GitHub repository",
+    ):
+        resolve_github_repository(
+            RepoConfig(),
+            GitRemote(name="origin", url="/tmp/remote.git"),
+        )
+
+
+def test_resolve_trunk_branch_prefers_configured_branch() -> None:
+    branch = resolve_trunk_branch(
+        client=_FakeJjClient({}),
+        config=RepoConfig(trunk_branch="release"),
+        github_repository_state=_github_repository(default_branch="main"),
+        remote=GitRemote(name="origin", url="git@example.com:org/repo.git"),
+        stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk123")),
+    )
+
+    assert branch == "release"
+
+
+def test_resolve_trunk_branch_uses_repository_default_branch() -> None:
+    branch = resolve_trunk_branch(
+        client=_FakeJjClient({}),
+        config=RepoConfig(),
+        github_repository_state=_github_repository(default_branch="main"),
+        remote=GitRemote(name="origin", url="git@example.com:org/repo.git"),
+        stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk123")),
+    )
+
+    assert branch == "main"
+
+
+def test_resolve_trunk_branch_falls_back_to_unique_remote_bookmark() -> None:
+    branch = resolve_trunk_branch(
+        client=_FakeJjClient(
+            {
+                "main": BookmarkState(
+                    name="main",
+                    remote_targets=(RemoteBookmarkState(remote="origin", targets=("trunk123",)),),
+                )
+            }
+        ),
+        config=RepoConfig(),
+        github_repository_state=_github_repository(default_branch=""),
+        remote=GitRemote(name="origin", url="git@example.com:org/repo.git"),
+        stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk123")),
+    )
+
+    assert branch == "main"
+
+
+def test_resolve_trunk_branch_rejects_ambiguous_remote_bookmarks() -> None:
+    with pytest.raises(
+        SubmitGithubResolutionError,
+        match="multiple remote bookmarks",
+    ):
+        resolve_trunk_branch(
+            client=_FakeJjClient(
+                {
+                    "main": BookmarkState(
+                        name="main",
+                        remote_targets=(
+                            RemoteBookmarkState(remote="origin", targets=("trunk123",)),
+                        ),
+                    ),
+                    "stable": BookmarkState(
+                        name="stable",
+                        remote_targets=(
+                            RemoteBookmarkState(remote="origin", targets=("trunk123",)),
+                        ),
+                    ),
+                }
+            ),
+            config=RepoConfig(),
+            github_repository_state=_github_repository(default_branch=""),
+            remote=GitRemote(name="origin", url="git@example.com:org/repo.git"),
+            stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk123")),
+        )
 
 
 def test_resolve_local_action_created_when_no_local_targets() -> None:
@@ -212,6 +332,34 @@ def test_should_update_untracked_remote_with_git_only_for_differing_untracked_re
     )
 
 
+def test_pull_request_linkage_rejects_missing_discovered_pull_request() -> None:
+    with pytest.raises(
+        SubmitPullRequestResolutionError,
+        match="Cached pull request linkage exists",
+    ):
+        _ensure_pull_request_linkage_is_consistent(
+            bookmark="review/foo",
+            cached_change=CachedChange(
+                bookmark="review/foo",
+                pr_number=17,
+                pr_url="https://github.test/octo-org/repo/pull/17",
+            ),
+            discovered_pull_request=None,
+        )
+
+
+def test_pull_request_linkage_rejects_mismatched_pull_request_number() -> None:
+    with pytest.raises(
+        SubmitPullRequestResolutionError,
+        match="Cached pull request #17 does not match",
+    ):
+        _ensure_pull_request_linkage_is_consistent(
+            bookmark="review/foo",
+            cached_change=CachedChange(bookmark="review/foo", pr_number=17),
+            discovered_pull_request=_github_pull_request(number=21),
+        )
+
+
 def test_ensure_unique_bookmarks_rejects_duplicate_names() -> None:
     resolutions = (
         ResolvedBookmark(
@@ -231,3 +379,35 @@ def test_ensure_unique_bookmarks_rejects_duplicate_names() -> None:
         match="multiple review units to the same bookmark",
     ):
         _ensure_unique_bookmarks(resolutions)
+
+
+class _FakeJjClient:
+    def __init__(self, states: dict[str, BookmarkState]) -> None:
+        self._states = states
+
+    def list_bookmark_states(self) -> dict[str, BookmarkState]:
+        return self._states
+
+
+def _github_pull_request(number: int) -> GithubPullRequest:
+    return GithubPullRequest(
+        base=GithubBranchRef(ref="main"),
+        body="",
+        head=GithubBranchRef(ref="review/foo"),
+        html_url=f"https://github.test/octo-org/repo/pull/{number}",
+        number=number,
+        state="open",
+        title="feature",
+    )
+
+
+def _github_repository(default_branch: str) -> GithubRepository:
+    return GithubRepository(
+        clone_url="https://github.test/octo-org/repo.git",
+        default_branch=default_branch,
+        full_name="octo-org/repo",
+        html_url="https://github.test/octo-org/repo",
+        name="repo",
+        private=True,
+        url="https://api.github.test/repos/octo-org/repo",
+    )

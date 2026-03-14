@@ -3,13 +3,43 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(slots=True)
+class FakeGithubPullRequest:
+    """Mutable pull request state served by the fake API."""
+
+    base_ref: str
+    body: str
+    head_label: str
+    head_ref: str
+    number: int
+    title: str
+    state: str = "open"
+
+    def to_payload(
+        self,
+        *,
+        repository: FakeGithubRepository,
+        web_origin: str,
+    ) -> dict[str, object]:
+        return {
+            "base": {"label": f"{repository.full_name}:{self.base_ref}", "ref": self.base_ref},
+            "body": self.body,
+            "head": {"label": self.head_label, "ref": self.head_ref},
+            "html_url": f"{web_origin}/{repository.full_name}/pull/{self.number}",
+            "number": self.number,
+            "state": self.state,
+            "title": self.title,
+        }
+
+
+@dataclass(slots=True)
 class FakeGithubRepository:
     """Repository metadata plus its backing bare Git repository."""
 
@@ -17,6 +47,8 @@ class FakeGithubRepository:
     git_dir: Path
     name: str
     owner: str
+    next_pull_request_number: int = 1
+    pull_requests: dict[int, FakeGithubPullRequest] = field(default_factory=dict)
 
     @property
     def full_name(self) -> str:
@@ -33,6 +65,27 @@ class FakeGithubRepository:
             "url": f"{api_origin}/repos/{self.full_name}",
         }
 
+    def create_pull_request(
+        self,
+        *,
+        base_ref: str,
+        body: str,
+        head_ref: str,
+        title: str,
+    ) -> FakeGithubPullRequest:
+        number = self.next_pull_request_number
+        self.next_pull_request_number += 1
+        pull_request = FakeGithubPullRequest(
+            base_ref=base_ref,
+            body=body,
+            head_label=f"{self.owner}:{head_ref}",
+            head_ref=head_ref,
+            number=number,
+            title=title,
+        )
+        self.pull_requests[number] = pull_request
+        return pull_request
+
 
 @dataclass(slots=True, frozen=True)
 class FakeGithubState:
@@ -47,20 +100,86 @@ class FakeGithubState:
         return cls(repositories={(repository.owner, repository.name): repository})
 
 
-def create_app(state: FakeGithubState) -> FastAPI:
+def create_app(fake_state: FakeGithubState) -> FastAPI:
     """Create a FastAPI app that serves the configured fake GitHub state."""
 
     app = FastAPI(docs_url=None, redoc_url=None, title="fake-github")
 
     @app.get("/repos/{owner}/{repo}")
     async def get_repository(owner: str, repo: str) -> dict[str, object]:
-        repository = state.repositories.get((owner, repo))
+        repository = fake_state.repositories.get((owner, repo))
         if repository is None:
             raise HTTPException(status_code=404, detail="Not Found")
         return repository.to_payload(
-            api_origin=state.api_origin,
-            web_origin=state.web_origin,
+            api_origin=fake_state.api_origin,
+            web_origin=fake_state.web_origin,
         )
+
+    @app.get("/repos/{owner}/{repo}/pulls")
+    async def list_pull_requests(
+        owner: str,
+        repo: str,
+        head: str | None = None,
+        state: str = "open",
+    ) -> list[dict[str, object]]:
+        repository = _get_repository(fake_state, owner, repo)
+        requested_state = state or "open"
+        pull_requests = list(repository.pull_requests.values())
+        if head is not None:
+            pull_requests = [
+                candidate for candidate in pull_requests if candidate.head_label == head
+            ]
+        if requested_state != "all":
+            pull_requests = [
+                candidate
+                for candidate in pull_requests
+                if candidate.state == requested_state
+            ]
+        return [
+            pull_request.to_payload(repository=repository, web_origin=fake_state.web_origin)
+            for pull_request in sorted(pull_requests, key=lambda candidate: candidate.number)
+        ]
+
+    @app.post("/repos/{owner}/{repo}/pulls", status_code=201)
+    async def create_pull_request(
+        owner: str,
+        repo: str,
+        payload: Annotated[dict[str, object], Body(...)],
+    ) -> dict[str, object]:
+        repository = _get_repository(fake_state, owner, repo)
+        title = _require_string(payload, "title")
+        head_ref = _require_string(payload, "head")
+        base_ref = _require_string(payload, "base")
+        body = _optional_string(payload, "body") or ""
+        _require_branch(repository, head_ref)
+        _require_branch(repository, base_ref)
+        pull_request = repository.create_pull_request(
+            base_ref=base_ref,
+            body=body,
+            head_ref=head_ref,
+            title=title,
+        )
+        return pull_request.to_payload(repository=repository, web_origin=fake_state.web_origin)
+
+    @app.patch("/repos/{owner}/{repo}/pulls/{pull_number}")
+    async def update_pull_request(
+        owner: str,
+        repo: str,
+        pull_number: int,
+        payload: Annotated[dict[str, object], Body(...)],
+    ) -> dict[str, object]:
+        repository = _get_repository(fake_state, owner, repo)
+        pull_request = repository.pull_requests.get(pull_number)
+        if pull_request is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if "title" in payload:
+            pull_request.title = _require_string(payload, "title")
+        if "body" in payload:
+            pull_request.body = _optional_string(payload, "body") or ""
+        if "base" in payload:
+            pull_request.base_ref = _require_string(payload, "base")
+            _require_branch(repository, pull_request.base_ref)
+        return pull_request.to_payload(repository=repository, web_origin=fake_state.web_origin)
 
     return app
 
@@ -98,3 +217,45 @@ def initialize_bare_repository(
         name=name,
         owner=owner,
     )
+
+
+def _get_repository(state: FakeGithubState, owner: str, repo: str) -> FakeGithubRepository:
+    repository = state.repositories.get((owner, repo))
+    if repository is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return repository
+
+
+def _optional_string(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    raise HTTPException(status_code=422, detail=f"Expected {key!r} to be a string.")
+
+
+def _require_branch(repository: FakeGithubRepository, branch: str) -> None:
+    completed = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(repository.git_dir),
+            "show-ref",
+            "--verify",
+            f"refs/heads/{branch}",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode == 0:
+        return
+    raise HTTPException(status_code=422, detail=f"Branch {branch!r} does not exist.")
+
+
+def _require_string(payload: dict[str, object], key: str) -> str:
+    value = _optional_string(payload, key)
+    if value is None:
+        raise HTTPException(status_code=422, detail=f"Missing required field {key!r}.")
+    return value

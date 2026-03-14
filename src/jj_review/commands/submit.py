@@ -1,19 +1,23 @@
-"""Submit command support for remote bookmark projection."""
+"""Submit command support for remote bookmark and pull request projection."""
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
+from urllib.parse import urlparse
 
 from jj_review.bookmarks import BookmarkResolver, BookmarkSource, ResolvedBookmark
 from jj_review.cache import ReviewStateStore
 from jj_review.config import ChangeConfig, RepoConfig
 from jj_review.errors import CliError
+from jj_review.github.client import GithubClient, GithubClientError
 from jj_review.jj import JjClient
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
-from jj_review.models.cache import ReviewState
+from jj_review.models.cache import CachedChange, ReviewState
+from jj_review.models.github import GithubPullRequest, GithubRepository
 
 
 class SubmitRemoteResolutionError(CliError):
@@ -36,30 +40,87 @@ class SubmitRemoteBookmarkOwnershipError(CliError):
     """Raised when `submit` cannot prove an existing remote branch belongs to it."""
 
 
+class SubmitGithubResolutionError(CliError):
+    """Raised when `submit` cannot resolve GitHub repository information."""
+
+
+class SubmitPullRequestResolutionError(CliError):
+    """Raised when `submit` cannot safely resolve a pull request."""
+
+
 LocalBookmarkAction = Literal["created", "moved", "unchanged"]
+PullRequestAction = Literal["created", "unchanged", "updated"]
 RemoteBookmarkAction = Literal["pushed", "up to date"]
+_DEFAULT_GITHUB_HOST = "github.com"
 
 
 @dataclass(frozen=True, slots=True)
 class SubmittedRevision:
-    """Remote projection result for one revision in the submitted stack."""
+    """Remote and GitHub projection result for one revision in the submitted stack."""
 
     bookmark: str
     bookmark_source: BookmarkSource
     change_id: str
     local_action: LocalBookmarkAction
+    pull_request_action: PullRequestAction
+    pull_request_number: int
+    pull_request_url: str
     remote_action: RemoteBookmarkAction
     subject: str
 
 
 @dataclass(frozen=True, slots=True)
 class SubmitResult:
-    """Projected remote bookmark state for the selected stack."""
+    """Projected remote bookmark and pull request state for the selected stack."""
 
     remote: GitRemote
     revisions: tuple[SubmittedRevision, ...]
     selected_revset: str
+    trunk_branch: str
     trunk_subject: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedGithubRepository:
+    """Resolved GitHub repository target for the selected remote."""
+
+    host: str
+    owner: str
+    repo: str
+
+    @property
+    def api_base_url(self) -> str:
+        if self.host == _DEFAULT_GITHUB_HOST:
+            return "https://api.github.com"
+        return f"https://api.{self.host}"
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.owner}/{self.repo}"
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedRemoteUrl:
+    """Owner, repo, and host parsed from a Git remote URL."""
+
+    host: str
+    owner: str
+    repo: str
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestSyncResult:
+    """Result of creating, reusing, or updating one pull request."""
+
+    action: PullRequestAction
+    pull_request: GithubPullRequest
+
+
+class BookmarkStateReader(Protocol):
+    """Subset of the jj client interface needed for trunk-branch fallback."""
+
+    def list_bookmark_states(self) -> dict[str, BookmarkState]:
+        """Return bookmark state keyed by bookmark name."""
 
 
 def run_submit(
@@ -69,8 +130,25 @@ def run_submit(
     repo_root: Path,
     revset: str | None,
 ) -> SubmitResult:
-    """Project the selected local stack to synthetic review bookmarks."""
+    """Project the selected local stack to synthetic review bookmarks and PRs."""
 
+    return asyncio.run(
+        _run_submit_async(
+            change_overrides=change_overrides,
+            config=config,
+            repo_root=repo_root,
+            revset=revset,
+        )
+    )
+
+
+async def _run_submit_async(
+    *,
+    change_overrides: dict[str, ChangeConfig],
+    config: RepoConfig,
+    repo_root: Path,
+    revset: str | None,
+) -> SubmitResult:
     client = JjClient(repo_root)
     stack = client.discover_review_stack(revset)
     remotes = client.list_git_remotes()
@@ -80,68 +158,125 @@ def run_submit(
     bookmark_result = BookmarkResolver(state, change_overrides).pin_revisions(stack.revisions)
     _ensure_unique_bookmarks(bookmark_result.resolutions)
 
-    revisions: list[SubmittedRevision] = []
-    for resolution, revision in zip(
-        bookmark_result.resolutions,
-        stack.revisions,
-        strict=True,
-    ):
-        bookmark_state = client.get_bookmark_state(resolution.bookmark)
-        local_action = _resolve_local_action(
-            resolution.bookmark, bookmark_state.local_targets, revision.commit_id
-        )
-        remote_state = bookmark_state.remote_target(remote.name)
-        _ensure_remote_can_be_updated(
-            bookmark=resolution.bookmark,
-            bookmark_source=resolution.source,
-            bookmark_state=bookmark_state,
-            change_id=revision.change_id,
-            desired_target=revision.commit_id,
-            remote=remote.name,
-            remote_state=remote_state,
-            state=state,
+    if not stack.revisions:
+        if bookmark_result.changed:
+            state_store.save(bookmark_result.state)
+        trunk_branch = config.trunk_branch
+        if trunk_branch is None:
+            remote_bookmarks = _remote_bookmarks_pointing_at_trunk(
+                client=client,
+                remote_name=remote.name,
+                trunk_commit_id=stack.trunk.commit_id,
+            )
+            if len(remote_bookmarks) == 1:
+                trunk_branch = remote_bookmarks[0]
+        return SubmitResult(
+            remote=remote,
+            revisions=(),
+            selected_revset=stack.selected_revset,
+            trunk_branch=trunk_branch or stack.trunk.subject,
+            trunk_subject=stack.trunk.subject,
         )
 
-        if local_action != "unchanged":
-            client.set_bookmark(resolution.bookmark, revision.commit_id)
+    github_repository = resolve_github_repository(config, remote)
+    state_changes = dict(bookmark_result.state.changes)
 
-        if _remote_is_up_to_date(remote_state, revision.commit_id):
-            remote_action = "up to date"
-        else:
-            if _should_update_untracked_remote_with_git(remote_state, revision.commit_id):
-                if remote_state is None:
-                    raise AssertionError("Checked remote bookmark state must exist.")
-                expected_remote_target = remote_state.target
-                if expected_remote_target is None:
-                    raise AssertionError("Checked remote bookmark target must be unambiguous.")
-                client.update_untracked_remote_bookmark(
-                    remote=remote.name,
-                    bookmark=resolution.bookmark,
-                    desired_target=revision.commit_id,
-                    expected_remote_target=expected_remote_target,
-                )
-            else:
-                client.push_bookmark(remote=remote.name, bookmark=resolution.bookmark)
-            remote_action = "pushed"
+    async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
+        github_repository_state = await _get_github_repository(
+            github_client,
+            github_repository=github_repository,
+        )
+        trunk_branch = resolve_trunk_branch(
+            client=client,
+            config=config,
+            github_repository_state=github_repository_state,
+            remote=remote,
+            stack=stack,
+        )
 
-        revisions.append(
-            SubmittedRevision(
+        revisions: list[SubmittedRevision] = []
+        for index, (resolution, revision) in enumerate(
+            zip(
+                bookmark_result.resolutions,
+                stack.revisions,
+                strict=True,
+            )
+        ):
+            bookmark_state = client.get_bookmark_state(resolution.bookmark)
+            local_action = _resolve_local_action(
+                resolution.bookmark,
+                bookmark_state.local_targets,
+                revision.commit_id,
+            )
+            remote_state = bookmark_state.remote_target(remote.name)
+            _ensure_remote_can_be_updated(
                 bookmark=resolution.bookmark,
                 bookmark_source=resolution.source,
+                bookmark_state=bookmark_state,
                 change_id=revision.change_id,
-                local_action=local_action,
-                remote_action=remote_action,
-                subject=revision.subject,
+                desired_target=revision.commit_id,
+                remote=remote.name,
+                remote_state=remote_state,
+                state=bookmark_result.state,
             )
-        )
 
-    if bookmark_result.changed:
-        state_store.save(bookmark_result.state)
+            if local_action != "unchanged":
+                client.set_bookmark(resolution.bookmark, revision.commit_id)
+
+            if _remote_is_up_to_date(remote_state, revision.commit_id):
+                remote_action = "up to date"
+            else:
+                if _should_update_untracked_remote_with_git(remote_state, revision.commit_id):
+                    if remote_state is None:
+                        raise AssertionError("Checked remote bookmark state must exist.")
+                    expected_remote_target = remote_state.target
+                    if expected_remote_target is None:
+                        raise AssertionError("Checked remote target must be unambiguous.")
+                    client.update_untracked_remote_bookmark(
+                        remote=remote.name,
+                        bookmark=resolution.bookmark,
+                        desired_target=revision.commit_id,
+                        expected_remote_target=expected_remote_target,
+                    )
+                else:
+                    client.push_bookmark(remote=remote.name, bookmark=resolution.bookmark)
+                remote_action = "pushed"
+
+            base_branch = revisions[index - 1].bookmark if index > 0 else trunk_branch
+            pull_request_result = await _sync_pull_request(
+                base_branch=base_branch,
+                bookmark=resolution.bookmark,
+                change_id=revision.change_id,
+                github_client=github_client,
+                github_repository=github_repository,
+                revision=revision,
+                state=bookmark_result.state,
+                state_changes=state_changes,
+            )
+
+            revisions.append(
+                SubmittedRevision(
+                    bookmark=resolution.bookmark,
+                    bookmark_source=resolution.source,
+                    change_id=revision.change_id,
+                    local_action=local_action,
+                    pull_request_action=pull_request_result.action,
+                    pull_request_number=pull_request_result.pull_request.number,
+                    pull_request_url=pull_request_result.pull_request.html_url,
+                    remote_action=remote_action,
+                    subject=revision.subject,
+                )
+            )
+
+    next_state = bookmark_result.state.model_copy(update={"changes": state_changes})
+    if bookmark_result.changed or next_state != state:
+        state_store.save(next_state)
 
     return SubmitResult(
         remote=remote,
         revisions=tuple(revisions),
         selected_revset=stack.selected_revset,
+        trunk_branch=trunk_branch,
         trunk_subject=stack.trunk.subject,
     )
 
@@ -167,6 +302,61 @@ def select_submit_remote(
     raise SubmitRemoteResolutionError(
         "Could not determine which Git remote to use for submit. Configure "
         "`repo.remote`, add an `origin` remote, or leave exactly one remote."
+    )
+
+
+def resolve_github_repository(
+    config: RepoConfig,
+    remote: GitRemote,
+) -> ResolvedGithubRepository:
+    """Resolve the GitHub repository target for the selected remote."""
+
+    parsed_remote = _parse_remote_url(remote.url)
+    host = config.github_host
+    if host == _DEFAULT_GITHUB_HOST and parsed_remote is not None:
+        host = parsed_remote.host
+    owner = config.github_owner or (parsed_remote.owner if parsed_remote else None)
+    repo = config.github_repo or (parsed_remote.repo if parsed_remote else None)
+    if owner and repo:
+        return ResolvedGithubRepository(host=host, owner=owner, repo=repo)
+    raise SubmitGithubResolutionError(
+        f"Could not determine the GitHub repository for remote {remote.name!r}. "
+        "Configure `repo.github_owner` and `repo.github_repo`, or use a GitHub remote "
+        "URL."
+    )
+
+
+def resolve_trunk_branch(
+    *,
+    client: BookmarkStateReader,
+    config: RepoConfig,
+    github_repository_state: GithubRepository,
+    remote: GitRemote,
+    stack: Any,
+) -> str:
+    """Resolve the GitHub base branch used for bottom-of-stack pull requests."""
+
+    if config.trunk_branch:
+        return config.trunk_branch
+    if github_repository_state.default_branch:
+        return github_repository_state.default_branch
+
+    remote_bookmarks = _remote_bookmarks_pointing_at_trunk(
+        client=client,
+        remote_name=remote.name,
+        trunk_commit_id=stack.trunk.commit_id,
+    )
+    if len(remote_bookmarks) == 1:
+        return remote_bookmarks[0]
+    if len(remote_bookmarks) > 1:
+        raise SubmitGithubResolutionError(
+            "Could not determine the trunk branch because multiple remote bookmarks on "
+            f"{remote.name!r} point at `trunk()`: {', '.join(remote_bookmarks)}."
+        )
+    raise SubmitGithubResolutionError(
+        f"Could not determine the trunk branch for remote {remote.name!r}. Configure "
+        "`repo.trunk_branch`, ensure the GitHub repository exposes a default branch, or "
+        "create one remote bookmark that points at `trunk()`."
     )
 
 
@@ -212,8 +402,8 @@ def _ensure_remote_can_be_updated(
         return
     if len(remote_state.targets) > 1:
         raise SubmitRemoteBookmarkConflictError(
-            f"Remote bookmark {bookmark!r}@{remote} is conflicted. Resolve it with `jj git "
-            "fetch` and retry."
+            f"Remote bookmark {bookmark!r}@{remote} is conflicted. Resolve it with `jj "
+            "git fetch` and retry."
         )
     if remote_state.target == desired_target:
         return
@@ -280,5 +470,279 @@ def _ensure_unique_bookmarks(resolutions: tuple[ResolvedBookmark, ...]) -> None:
     )
     raise SubmitBookmarkCollisionError(
         "Selected stack resolves multiple review units to the same bookmark: "
-        f"{collision_descriptions}. Configure distinct bookmark names before submitting."
+        f"{collision_descriptions}. Configure distinct bookmark names before "
+        "submitting."
     )
+
+
+async def _get_github_repository(
+    github_client: GithubClient,
+    *,
+    github_repository: ResolvedGithubRepository,
+) -> GithubRepository:
+    try:
+        return await github_client.get_repository(
+            github_repository.owner,
+            github_repository.repo,
+        )
+    except GithubClientError as error:
+        raise SubmitGithubResolutionError(
+            f"Could not load GitHub repository {github_repository.full_name}: {error}"
+        ) from error
+
+
+async def _sync_pull_request(
+    *,
+    base_branch: str,
+    bookmark: str,
+    change_id: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    revision: Any,
+    state: ReviewState,
+    state_changes: dict[str, CachedChange],
+) -> PullRequestSyncResult:
+    head_label = f"{github_repository.owner}:{bookmark}"
+    discovered_pull_request = await _discover_pull_request(
+        github_client=github_client,
+        github_repository=github_repository,
+        head_label=head_label,
+    )
+    cached_change = state.changes.get(change_id)
+    _ensure_pull_request_linkage_is_consistent(
+        bookmark=bookmark,
+        cached_change=cached_change,
+        discovered_pull_request=discovered_pull_request,
+    )
+
+    title = revision.subject
+    body = _pull_request_body(revision.description)
+    if discovered_pull_request is None:
+        pull_request = await _create_pull_request(
+            base_branch=base_branch,
+            body=body,
+            github_client=github_client,
+            github_repository=github_repository,
+            head_branch=bookmark,
+            title=title,
+        )
+        action: PullRequestAction = "created"
+    elif _pull_request_matches(
+        base_branch=base_branch,
+        body=body,
+        pull_request=discovered_pull_request,
+        title=title,
+    ):
+        pull_request = discovered_pull_request
+        action = "unchanged"
+    else:
+        pull_request = await _update_pull_request(
+            base_branch=base_branch,
+            body=body,
+            github_client=github_client,
+            github_repository=github_repository,
+            pull_request=discovered_pull_request,
+            title=title,
+        )
+        action = "updated"
+
+    state_changes[change_id] = _updated_cached_change(
+        bookmark=bookmark,
+        cached_change=cached_change,
+        pull_request=pull_request,
+    )
+    return PullRequestSyncResult(action=action, pull_request=pull_request)
+
+
+async def _discover_pull_request(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    head_label: str,
+) -> GithubPullRequest | None:
+    try:
+        pull_requests = await github_client.list_pull_requests(
+            github_repository.owner,
+            github_repository.repo,
+            head=head_label,
+        )
+    except GithubClientError as error:
+        raise SubmitPullRequestResolutionError(
+            f"Could not list pull requests for head {head_label!r}: {error}"
+        ) from error
+
+    if len(pull_requests) > 1:
+        raise SubmitPullRequestResolutionError(
+            f"GitHub reports multiple pull requests for head branch {head_label!r}. "
+            "Repair the linkage with `sync` or `adopt` before submitting again."
+        )
+    if not pull_requests:
+        return None
+    pull_request = pull_requests[0]
+    if pull_request.state != "open":
+        raise SubmitPullRequestResolutionError(
+            f"GitHub reports pull request #{pull_request.number} for head branch "
+            f"{head_label!r} in state {pull_request.state!r}. Repair the linkage with "
+            "`sync` or `adopt` before submitting again."
+        )
+    return pull_request
+
+
+def _ensure_pull_request_linkage_is_consistent(
+    *,
+    bookmark: str,
+    cached_change: CachedChange | None,
+    discovered_pull_request: GithubPullRequest | None,
+) -> None:
+    if cached_change is None or (
+        cached_change.pr_number is None and cached_change.pr_url is None
+    ):
+        return
+    if discovered_pull_request is None:
+        raise SubmitPullRequestResolutionError(
+            f"Cached pull request linkage exists for bookmark {bookmark!r}, but GitHub "
+            "no longer reports a PR for that head branch. Repair the linkage with "
+            "`sync` or `adopt` before submitting again."
+        )
+    if cached_change.pr_number not in (None, discovered_pull_request.number):
+        raise SubmitPullRequestResolutionError(
+            f"Cached pull request #{cached_change.pr_number} does not match the PR "
+            f"GitHub reports for bookmark {bookmark!r} "
+            f"(#{discovered_pull_request.number}). Repair the linkage with `sync` or "
+            "`adopt` before submitting again."
+        )
+    if cached_change.pr_url not in (None, discovered_pull_request.html_url):
+        raise SubmitPullRequestResolutionError(
+            f"Cached pull request URL for bookmark {bookmark!r} does not match "
+            "GitHub. Repair the linkage with `sync` or `adopt` before submitting "
+            "again."
+        )
+
+
+async def _create_pull_request(
+    *,
+    base_branch: str,
+    body: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    head_branch: str,
+    title: str,
+) -> GithubPullRequest:
+    try:
+        return await github_client.create_pull_request(
+            github_repository.owner,
+            github_repository.repo,
+            base=base_branch,
+            body=body,
+            head=head_branch,
+            title=title,
+        )
+    except GithubClientError as error:
+        raise SubmitPullRequestResolutionError(
+            f"Could not create a pull request for branch {head_branch!r}: {error}"
+        ) from error
+
+
+async def _update_pull_request(
+    *,
+    base_branch: str,
+    body: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    pull_request: GithubPullRequest,
+    title: str,
+) -> GithubPullRequest:
+    try:
+        return await github_client.update_pull_request(
+            github_repository.owner,
+            github_repository.repo,
+            pull_number=pull_request.number,
+            base=base_branch,
+            body=body,
+            title=title,
+        )
+    except GithubClientError as error:
+        raise SubmitPullRequestResolutionError(
+            f"Could not update pull request #{pull_request.number}: {error}"
+        ) from error
+
+
+def _pull_request_body(description: str) -> str:
+    lines = description.splitlines()
+    if len(lines) < 2:
+        return ""
+    return "\n".join(lines[1:]).strip()
+
+
+def _pull_request_matches(
+    *,
+    base_branch: str,
+    body: str,
+    pull_request: GithubPullRequest,
+    title: str,
+) -> bool:
+    return (
+        pull_request.base.ref == base_branch
+        and (pull_request.body or "") == body
+        and pull_request.title == title
+    )
+
+
+def _updated_cached_change(
+    *,
+    bookmark: str,
+    cached_change: CachedChange | None,
+    pull_request: GithubPullRequest,
+) -> CachedChange:
+    if cached_change is None:
+        return CachedChange(
+            bookmark=bookmark,
+            pr_number=pull_request.number,
+            pr_url=pull_request.html_url,
+        )
+    return cached_change.model_copy(
+        update={
+            "bookmark": bookmark,
+            "pr_number": pull_request.number,
+            "pr_url": pull_request.html_url,
+        }
+    )
+
+
+def _build_github_client(*, base_url: str) -> GithubClient:
+    return GithubClient(base_url=base_url)
+
+
+def _remote_bookmarks_pointing_at_trunk(
+    *,
+    client: BookmarkStateReader,
+    remote_name: str,
+    trunk_commit_id: str,
+) -> tuple[str, ...]:
+    states = client.list_bookmark_states()
+    matches = [
+        name
+        for name, bookmark_state in states.items()
+        if (remote_state := bookmark_state.remote_target(remote_name)) is not None
+        and remote_state.target == trunk_commit_id
+    ]
+    return tuple(sorted(matches))
+
+
+def _parse_remote_url(url: str) -> ParsedRemoteUrl | None:
+    parsed = urlparse(url)
+    if parsed.scheme in {"http", "https", "ssh"} and parsed.hostname:
+        return _build_parsed_remote_url(parsed.hostname, parsed.path)
+    if parsed.scheme == "" and ":" in url and "@" in url.partition(":")[0]:
+        host, _, path = url.partition(":")
+        return _build_parsed_remote_url(host.rsplit("@", maxsplit=1)[-1], path)
+    return None
+
+
+def _build_parsed_remote_url(host: str, raw_path: str) -> ParsedRemoteUrl | None:
+    normalized_path = raw_path.lstrip("/").removesuffix(".git")
+    parts = [part for part in normalized_path.split("/") if part]
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    return ParsedRemoteUrl(host=host, owner=owner, repo=repo)
