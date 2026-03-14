@@ -23,6 +23,10 @@ class SubmitBookmarkCollisionError(CliError):
     """Raised when multiple review units resolve to the same bookmark."""
 
 
+class SubmitBookmarkConflictError(CliError):
+    """Raised when a local bookmark has multiple conflicting targets."""
+
+
 LocalBookmarkAction = Literal["created", "moved", "unchanged"]
 RemoteBookmarkAction = Literal["pushed", "up to date"]
 
@@ -76,7 +80,9 @@ def run_submit(
         strict=True,
     ):
         bookmark_state = client.get_bookmark_state(resolution.bookmark)
-        local_action = _resolve_local_action(bookmark_state.local_target, revision.commit_id)
+        local_action = _resolve_local_action(
+            resolution.bookmark, bookmark_state.local_targets, revision.commit_id
+        )
         if local_action != "unchanged":
             client.set_bookmark(resolution.bookmark, revision.commit_id)
 
@@ -130,7 +136,17 @@ def select_submit_remote(
     )
 
 
-def _resolve_local_action(local_target: str | None, desired_target: str) -> LocalBookmarkAction:
+def _resolve_local_action(
+    bookmark: str,
+    local_targets: tuple[str, ...],
+    desired_target: str,
+) -> LocalBookmarkAction:
+    if len(local_targets) > 1:
+        raise SubmitBookmarkConflictError(
+            f"Bookmark {bookmark!r} has {len(local_targets)} conflicting local targets. "
+            "Resolve the bookmark conflict with `jj bookmark` before submitting."
+        )
+    local_target = local_targets[0] if local_targets else None
     if local_target == desired_target:
         return "unchanged"
     if local_target is None:

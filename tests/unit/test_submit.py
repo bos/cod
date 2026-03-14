@@ -5,9 +5,11 @@ import pytest
 from jj_review.bookmarks import ResolvedBookmark
 from jj_review.commands.submit import (
     SubmitBookmarkCollisionError,
+    SubmitBookmarkConflictError,
     SubmitRemoteResolutionError,
     _ensure_unique_bookmarks,
     _remote_is_up_to_date,
+    _resolve_local_action,
     select_submit_remote,
 )
 from jj_review.config import RepoConfig
@@ -67,6 +69,26 @@ def test_select_submit_remote_rejects_ambiguous_remote_set_without_origin() -> N
                 GitRemote(name="upstream", url="git@example.com:org/repo.git"),
             ),
         )
+
+
+def test_resolve_local_action_created_when_no_local_targets() -> None:
+    assert _resolve_local_action("review/foo", (), "abc123") == "created"
+
+
+def test_resolve_local_action_unchanged_when_target_matches() -> None:
+    assert _resolve_local_action("review/foo", ("abc123",), "abc123") == "unchanged"
+
+
+def test_resolve_local_action_moved_when_target_differs() -> None:
+    assert _resolve_local_action("review/foo", ("old123",), "abc123") == "moved"
+
+
+def test_resolve_local_action_rejects_conflicted_bookmark() -> None:
+    with pytest.raises(
+        SubmitBookmarkConflictError,
+        match="2 conflicting local targets",
+    ):
+        _resolve_local_action("review/foo", ("abc123", "def456"), "abc123")
 
 
 def test_remote_is_up_to_date_when_untracked_remote_target_matches() -> None:
