@@ -83,7 +83,12 @@ def _resolve_logging_level(level_name: str, *, original_value: str) -> int:
 
 
 def resolve_repo_root(start_dir: Path) -> Path:
-    """Use `jj root` when available and fall back to the requested directory."""
+    """Resolve the jj workspace root from `start_dir`.
+
+    Raises `BootstrapError` if the directory is not inside a jj workspace,
+    so callers get a clear diagnostic rather than confusing downstream
+    errors from later `jj` commands.
+    """
 
     try:
         completed = subprocess.run(
@@ -96,10 +101,17 @@ def resolve_repo_root(start_dir: Path) -> Path:
     except FileNotFoundError as error:
         raise BootstrapError("`jj` is not installed or is not on PATH.") from error
     if completed.returncode != 0:
-        return start_dir
+        message = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        raise BootstrapError(
+            f"Not inside a jj workspace (from {start_dir}): {message}"
+        )
 
     root = completed.stdout.strip()
-    return Path(root) if root else start_dir
+    if not root:
+        raise BootstrapError(
+            f"`jj root` returned an empty path (from {start_dir})."
+        )
+    return Path(root)
 
 
 def _resolve_optional_path(raw_path: object) -> Path | None:

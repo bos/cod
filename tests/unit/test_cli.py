@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from jj_review.bootstrap import resolve_repo_root
 from jj_review.cli import main
 from jj_review.config import CONFIG_DIRNAME, CONFIG_FILENAME
 
@@ -56,6 +57,8 @@ def test_main_reports_invalid_logging_level_without_traceback(
     config_path.parent.mkdir(parents=True)
     config_path.write_text('[logging]\nlevel = "DEBIG"\n', encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config-home"))
+    # Bypass jj workspace resolution so the test focuses on config validation.
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
 
     exit_code = main(["--repository", str(tmp_path), "submit"])
     captured = capsys.readouterr()
@@ -63,6 +66,23 @@ def test_main_reports_invalid_logging_level_without_traceback(
     assert exit_code == 1
     assert "Invalid logging level" in captured.err
     assert "DEBIG" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_reports_non_jj_directory_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A plain directory with no jj workspace should fail fast with a clear
+    # BootstrapError, not silently proceed and fail later.
+    plain_dir = tmp_path / "not-a-jj-repo"
+    plain_dir.mkdir()
+
+    exit_code = main(["--repository", str(plain_dir), "submit"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Not inside a jj workspace" in captured.err
     assert "Traceback" not in captured.err
 
 
