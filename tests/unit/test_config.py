@@ -94,8 +94,6 @@ def test_load_config_reads_per_change_overrides(
             [
                 f'[change."{change_id}"]',
                 'bookmark_override = "review/custom-name"',
-                "draft = true",
-                "skip = false",
                 "",
             ]
         ),
@@ -106,8 +104,6 @@ def test_load_config_reads_per_change_overrides(
     config = load_config(repo_root=tmp_path)
 
     assert config.change[change_id].bookmark_override == "review/custom-name"
-    assert config.change[change_id].draft is True
-    assert config.change[change_id].skip is False
 
 
 def test_load_config_rejects_unexpected_top_level_keys(

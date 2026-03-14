@@ -186,7 +186,7 @@ mixed into machine-written review state. Those include:
 - repo defaults such as preferred remote, trunk branch, or GitHub owner/repo
   override
 - explicit bookmark-name override for a specific change
-- per-change user preferences such as draft or skip-review
+- per-change user preferences (future extension point; no MVP examples yet)
 
 ### Reviewer-Facing Stack Metadata
 
@@ -315,7 +315,9 @@ This design behaves well under normal `jj` rewrite-heavy workflows:
 - Abandon: `jj` deletes bookmarks attached to abandoned commits. The tool can then close the PR,
   leave it open with a warning, or mark it stale.
 - Split: new logical review units get new change IDs, which should usually
-  become new PRs. This is a feature, not a bug.
+  become new PRs. The original change still exists with the same `change_id`
+  but a smaller diff; it is updated normally on next submit. This is a feature,
+  not a bug.
 - Ancestor merged on GitHub: merged ancestors stop acting as review bases.
   Descendants should target the nearest remaining open ancestor PR, or trunk if
   none remain. For the MVP, the tool should require a matching local `jj`
@@ -452,8 +454,9 @@ Suggested config path:
 ~/.config/jj-review/config.toml
 ```
 
-User-authored per-change overrides such as `bookmark_override`, `draft`, or
-`skip` belong in config, not in the machine-written state file.
+User-authored per-change overrides such as `bookmark_override` belong in
+config, not in the machine-written state file. Additional per-change
+preferences are a future extension point.
 
 ## MVP Boundary
 

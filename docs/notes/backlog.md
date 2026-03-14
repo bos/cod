@@ -1,8 +1,51 @@
-## Crash handling
+# Backlog
 
-There's a variety of ways in which a crash or ctrl-C can cause potentially persistent
-failures. We need to figure out how to test for those, what the failure modes are, and how to
-recover from those that we can't prevent.
+Items that need to be implemented or thought through, but are not blocking
+current slices.
 
-We should also be mindful of atomic write-tempfile-then-rename modifications to tool-controlled
-files, so that partially written files can't exist or be read.
+## Crash and Interrupt Recovery
+
+There's a variety of ways in which a crash or ctrl-C can cause potentially
+persistent failures. We need to figure out how to test for those, what the
+failure modes are, and how to recover from those that we can't prevent.
+
+We should also be mindful of atomic write-tempfile-then-rename modifications to
+tool-controlled files, so that partially written files can't exist or be read.
+
+## Concurrency and Rate Limiting
+
+The submit algorithm walks bottom-to-top creating/updating PRs sequentially.
+For deep stacks this means many API round trips. We need to decide whether to
+batch or parallelize GitHub API calls, and handle GitHub rate limiting
+gracefully. Acceptable to stay serial for the MVP.
+
+## Ancestor Merged on GitHub
+
+The design doc says "require a local `jj rebase` before changing the PR base"
+when an ancestor PR has merged. We need to flesh out:
+
+- how the tool detects the mismatch between local parentage and GitHub merge
+  state
+- what the diagnostic looks like
+- whether there are edge cases around partial-stack merges
+
+## Bookmark Naming Collisions
+
+The MVP rejects bookmark naming collisions from user overrides, but two changes
+could theoretically produce the same slug+suffix. The 8-char `change_id` suffix
+makes this extremely unlikely, but the tool should detect it and fail with a
+clear diagnostic describing what went wrong and how to resolve it (e.g., set an
+explicit bookmark override for one of the changes).
+
+## Minimum JJ Version
+
+The implementation shells out to `jj` and relies on machine-readable template
+output. We need to either pin a minimum `jj` version or add a capability check
+at startup to confirm the expected template syntax works.
+
+## Draft PR Support
+
+GitHub has a native draft PR concept (visible but not reviewable or mergeable
+until marked ready). We should eventually support creating PRs as drafts and
+promoting them, but the semantics need to be designed before adding it. Deferred
+from MVP.

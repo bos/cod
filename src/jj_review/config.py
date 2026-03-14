@@ -46,8 +46,6 @@ class ChangeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bookmark_override: str | None = None
-    draft: bool | None = None
-    skip: bool | None = None
 
 
 class LoggingConfig(BaseModel):
