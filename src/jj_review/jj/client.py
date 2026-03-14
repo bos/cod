@@ -15,7 +15,9 @@ from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkS
 from jj_review.models.stack import LocalRevision, LocalStack
 
 _COMMIT_TEMPLATE = (
-    r'json(self) ++ "\t" ++ json(empty) ++ "\t" ++ json(divergent) ++ "\t" ++ '
+    r'json(change_id) ++ "\t" ++ json(commit_id) ++ "\t" ++ json(description) ++ "\t" ++ '
+    r'json(parents.map(|p| p.commit_id())) ++ "\t" ++ '
+    r'json(empty) ++ "\t" ++ json(divergent) ++ "\t" ++ '
     r'json(current_working_copy) ++ "\t" ++ json(immutable) ++ "\n"'
 )
 _BOOKMARK_TEMPLATE = r'json(self) ++ "\n"'
@@ -288,35 +290,41 @@ def _default_runner(command: Sequence[str], cwd: Path) -> subprocess.CompletedPr
     )
 
 
+_EXPECTED_FIELD_COUNT = 8
+
+
 def _parse_revision_line(line: str) -> LocalRevision:
     parts = line.split("\t")
-    if len(parts) != 5:
+    if len(parts) != _EXPECTED_FIELD_COUNT:
         raise JjCommandError(
-            f"`jj log` output has unexpected format: expected 5 tab-separated fields, "
-            f"got {len(parts)}. Raw line: {line!r}"
+            f"`jj log` output has unexpected format: expected {_EXPECTED_FIELD_COUNT} "
+            f"tab-separated fields, got {len(parts)}. Raw line: {line!r}"
         )
-    commit_json, empty_json, divergent_json, working_copy_json, immutable_json = parts
+    change_id_json, commit_id_json, description_json, parents_json, empty_json, divergent_json, working_copy_json, immutable_json = parts  # fmt: skip
     try:
-        commit = json.loads(commit_json)
-    except json.JSONDecodeError as error:
-        raise JjCommandError(
-            f"`jj log` output contains invalid JSON: {error}. Raw value: {commit_json!r}"
-        ) from error
-    try:
+        parents_raw = json.loads(parents_json)
+        if not isinstance(parents_raw, list):
+            raise JjCommandError(
+                f"`jj log` output has unexpected field types: "
+                f"parents field is not a JSON array. Raw line: {line!r}"
+            )
         return LocalRevision(
-            change_id=commit["change_id"],
-            commit_id=commit["commit_id"],
+            change_id=json.loads(change_id_json),
+            commit_id=json.loads(commit_id_json),
             current_working_copy=json.loads(working_copy_json),
-            description=commit["description"],
+            description=json.loads(description_json),
             divergent=json.loads(divergent_json),
             empty=json.loads(empty_json),
             immutable=json.loads(immutable_json),
-            parents=tuple(commit["parents"]),
+            parents=tuple(parents_raw),
         )
-    except (KeyError, ValueError) as error:
+    except json.JSONDecodeError as error:
         raise JjCommandError(
-            f"`jj log` output is missing expected fields: {error}. "
-            f"Raw commit JSON: {commit_json!r}"
+            f"`jj log` output contains invalid JSON: {error}. Raw line: {line!r}"
+        ) from error
+    except (TypeError, ValueError) as error:
+        raise JjCommandError(
+            f"`jj log` output has unexpected field types: {error}. Raw line: {line!r}"
         ) from error
 
 

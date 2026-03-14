@@ -7,66 +7,95 @@ import pytest
 
 from jj_review.jj import JjClient, JjCommandError, UnsupportedStackError
 
-_TRUNK = (
-    '{"commit_id":"trunk","parents":["root"],"change_id":"trunk-change",'
-    '"description":"main\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+def _revision_line(
+    *,
+    commit_id: str,
+    parents: list[str],
+    change_id: str,
+    description: str,
+    empty: bool = False,
+    divergent: bool = False,
+    working_copy: bool = False,
+    immutable: bool = False,
+) -> str:
+    import json
+
+    fields = [
+        json.dumps(change_id),
+        json.dumps(commit_id),
+        json.dumps(description),
+        json.dumps(parents),
+        "true" if empty else "false",
+        "true" if divergent else "false",
+        "true" if working_copy else "false",
+        "true" if immutable else "false",
+    ]
+    return "\t".join(fields) + "\n"
+
+
+_TRUNK = _revision_line(
+    commit_id="trunk", parents=["root"], change_id="trunk-change", description="main\n"
 )
-_ROOT = (
-    '{"commit_id":"root","parents":[],"change_id":"root-change",'
-    '"description":"\\n","author":{},"committer":{}}'
-    "\ttrue\tfalse\tfalse\ttrue\n"
+_ROOT = _revision_line(
+    commit_id="root",
+    parents=[],
+    change_id="root-change",
+    description="\n",
+    empty=True,
+    immutable=True,
 )
-_EMPTY_WORKING_COPY = (
-    '{"commit_id":"wc","parents":["head"],"change_id":"wc-change",'
-    '"description":"\\n","author":{},"committer":{}}'
-    "\ttrue\tfalse\ttrue\tfalse\n"
+_EMPTY_WORKING_COPY = _revision_line(
+    commit_id="wc",
+    parents=["head"],
+    change_id="wc-change",
+    description="\n",
+    empty=True,
+    working_copy=True,
 )
-_HEAD = (
-    '{"commit_id":"head","parents":["parent"],"change_id":"head-change",'
-    '"description":"head\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_HEAD = _revision_line(
+    commit_id="head", parents=["parent"], change_id="head-change", description="head\n"
 )
-_HEAD_ON_IMMUTABLE_PARENT = (
-    '{"commit_id":"head","parents":["immutable-parent"],"change_id":"head-change",'
-    '"description":"head\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_HEAD_ON_IMMUTABLE_PARENT = _revision_line(
+    commit_id="head",
+    parents=["immutable-parent"],
+    change_id="head-change",
+    description="head\n",
 )
-_PARENT = (
-    '{"commit_id":"parent","parents":["trunk"],"change_id":"parent-change",'
-    '"description":"parent\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_PARENT = _revision_line(
+    commit_id="parent", parents=["trunk"], change_id="parent-change", description="parent\n"
 )
-_MERGE = (
-    '{"commit_id":"merge","parents":["left","right"],"change_id":"merge-change",'
-    '"description":"merge\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_MERGE = _revision_line(
+    commit_id="merge",
+    parents=["left", "right"],
+    change_id="merge-change",
+    description="merge\n",
 )
-_DIVERGENT = (
-    '{"commit_id":"divergent","parents":["trunk"],"change_id":"div-change",'
-    '"description":"divergent\\n","author":{},"committer":{}}'
-    "\tfalse\ttrue\tfalse\tfalse\n"
+_DIVERGENT = _revision_line(
+    commit_id="divergent",
+    parents=["trunk"],
+    change_id="div-change",
+    description="divergent\n",
+    divergent=True,
 )
-_IMMUTABLE_PARENT = (
-    '{"commit_id":"immutable-parent","parents":["trunk"],'
-    '"change_id":"immutable-parent-change","description":"immutable parent\\n",'
-    '"author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\ttrue\n"
+_IMMUTABLE_PARENT = _revision_line(
+    commit_id="immutable-parent",
+    parents=["trunk"],
+    change_id="immutable-parent-change",
+    description="immutable parent\n",
+    immutable=True,
 )
-_CHILD_A = (
-    '{"commit_id":"child-a","parents":["parent"],"change_id":"child-a-change",'
-    '"description":"child a\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_CHILD_A = _revision_line(
+    commit_id="child-a", parents=["parent"], change_id="child-a-change", description="child a\n"
 )
-_CHILD_B = (
-    '{"commit_id":"child-b","parents":["parent"],"change_id":"child-b-change",'
-    '"description":"child b\\n","author":{},"committer":{}}'
-    "\tfalse\tfalse\tfalse\tfalse\n"
+_CHILD_B = _revision_line(
+    commit_id="child-b", parents=["parent"], change_id="child-b-change", description="child b\n"
 )
-_DIVERGENT_SIBLING = (
-    '{"commit_id":"div-sibling","parents":["parent"],"change_id":"div-sibling-change",'
-    '"description":"divergent sibling\\n","author":{},"committer":{}}'
-    "\tfalse\ttrue\tfalse\tfalse\n"
+_DIVERGENT_SIBLING = _revision_line(
+    commit_id="div-sibling",
+    parents=["parent"],
+    change_id="div-sibling-change",
+    description="divergent sibling\n",
+    divergent=True,
 )
 
 
@@ -183,10 +212,16 @@ def test_discover_review_stack_raises_jj_command_error_on_wrong_field_count() ->
 
 
 def test_discover_review_stack_raises_jj_command_error_on_invalid_json() -> None:
+    # An invalid JSON value in any field should raise JjCommandError, not a
+    # bare json.JSONDecodeError.
     responses: dict[tuple[str, ...], str] = {
         ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
         ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
-            "NOT_JSON\tfalse\tfalse\tfalse\tfalse\n"
+            "NOT_JSON\t"
+            '"commit-id"\t'
+            '"desc"\t'
+            "[]"
+            "\tfalse\tfalse\tfalse\tfalse\n"
         ),
     }
 
@@ -195,16 +230,22 @@ def test_discover_review_stack_raises_jj_command_error_on_invalid_json() -> None
         client.discover_review_stack("head")
 
 
-def test_discover_review_stack_raises_jj_command_error_on_missing_fields() -> None:
+def test_discover_review_stack_raises_jj_command_error_on_wrong_field_type() -> None:
+    # A JSON value of the wrong type (e.g. parents as a string, not a list)
+    # should raise JjCommandError rather than a bare TypeError/ValueError.
     responses: dict[tuple[str, ...], str] = {
         ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
         ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
-            '{"commit_id":"head"}\tfalse\tfalse\tfalse\tfalse\n'
+            '"change-id"\t'
+            '"commit-id"\t'
+            '"desc"\t'
+            '"not-a-list"\t'  # parents must be a list
+            "false\tfalse\tfalse\tfalse\n"
         ),
     }
 
     client = JjClient(Path("/repo"), runner=_runner(responses))
-    with pytest.raises(JjCommandError, match="missing expected fields"):
+    with pytest.raises(JjCommandError, match="unexpected field types"):
         client.discover_review_stack("head")
 
 
@@ -232,7 +273,9 @@ def test_discover_review_stack_excludes_divergent_siblings_from_child_count() ->
 
 def _template() -> str:
     return (
-        r'json(self) ++ "\t" ++ json(empty) ++ "\t" ++ json(divergent) ++ "\t" ++ '
+        r'json(change_id) ++ "\t" ++ json(commit_id) ++ "\t" ++ json(description) ++ "\t" ++ '
+        r'json(parents.map(|p| p.commit_id())) ++ "\t" ++ '
+        r'json(empty) ++ "\t" ++ json(divergent) ++ "\t" ++ '
         r'json(current_working_copy) ++ "\t" ++ json(immutable) ++ "\n"'
     )
 
