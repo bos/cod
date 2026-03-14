@@ -289,18 +289,35 @@ def _default_runner(command: Sequence[str], cwd: Path) -> subprocess.CompletedPr
 
 
 def _parse_revision_line(line: str) -> LocalRevision:
-    commit_json, empty_json, divergent_json, working_copy_json, immutable_json = line.split("\t")
-    commit = json.loads(commit_json)
-    return LocalRevision(
-        change_id=commit["change_id"],
-        commit_id=commit["commit_id"],
-        current_working_copy=json.loads(working_copy_json),
-        description=commit["description"],
-        divergent=json.loads(divergent_json),
-        empty=json.loads(empty_json),
-        immutable=json.loads(immutable_json),
-        parents=tuple(commit["parents"]),
-    )
+    parts = line.split("\t")
+    if len(parts) != 5:
+        raise JjCommandError(
+            f"`jj log` output has unexpected format: expected 5 tab-separated fields, "
+            f"got {len(parts)}. Raw line: {line!r}"
+        )
+    commit_json, empty_json, divergent_json, working_copy_json, immutable_json = parts
+    try:
+        commit = json.loads(commit_json)
+    except json.JSONDecodeError as error:
+        raise JjCommandError(
+            f"`jj log` output contains invalid JSON: {error}. Raw value: {commit_json!r}"
+        ) from error
+    try:
+        return LocalRevision(
+            change_id=commit["change_id"],
+            commit_id=commit["commit_id"],
+            current_working_copy=json.loads(working_copy_json),
+            description=commit["description"],
+            divergent=json.loads(divergent_json),
+            empty=json.loads(empty_json),
+            immutable=json.loads(immutable_json),
+            parents=tuple(commit["parents"]),
+        )
+    except (KeyError, ValueError) as error:
+        raise JjCommandError(
+            f"`jj log` output is missing expected fields: {error}. "
+            f"Raw commit JSON: {commit_json!r}"
+        ) from error
 
 
 def _require_sequence(value: Any) -> Sequence[str]:

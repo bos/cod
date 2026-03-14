@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from jj_review.jj import JjClient, UnsupportedStackError
+from jj_review.jj import JjClient, JjCommandError, UnsupportedStackError
 
 _TRUNK = (
     '{"commit_id":"trunk","parents":["root"],"change_id":"trunk-change",'
@@ -166,6 +166,45 @@ def test_discover_review_stack_rejects_multiple_reviewable_children() -> None:
         UnsupportedStackError,
         match="multiple reviewable children require separate PR chains",
     ):
+        client.discover_review_stack("head")
+
+
+def test_discover_review_stack_raises_jj_command_error_on_wrong_field_count() -> None:
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
+            "not\tenough\n"
+        ),
+    }
+
+    client = JjClient(Path("/repo"), runner=_runner(responses))
+    with pytest.raises(JjCommandError, match="unexpected format"):
+        client.discover_review_stack("head")
+
+
+def test_discover_review_stack_raises_jj_command_error_on_invalid_json() -> None:
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
+            "NOT_JSON\tfalse\tfalse\tfalse\tfalse\n"
+        ),
+    }
+
+    client = JjClient(Path("/repo"), runner=_runner(responses))
+    with pytest.raises(JjCommandError, match="invalid JSON"):
+        client.discover_review_stack("head")
+
+
+def test_discover_review_stack_raises_jj_command_error_on_missing_fields() -> None:
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
+            '{"commit_id":"head"}\tfalse\tfalse\tfalse\tfalse\n'
+        ),
+    }
+
+    client = JjClient(Path("/repo"), runner=_runner(responses))
+    with pytest.raises(JjCommandError, match="missing expected fields"):
         client.discover_review_stack("head")
 
 
