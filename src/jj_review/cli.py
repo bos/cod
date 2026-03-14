@@ -12,6 +12,7 @@ from jj_review import __version__
 from jj_review.bookmarks import BookmarkResolver
 from jj_review.bootstrap import BootstrapError, bootstrap_context
 from jj_review.cache import ReviewStateStore
+from jj_review.commands.submit import run_submit
 from jj_review.errors import CliError, CommandNotImplementedError
 from jj_review.jj import JjClient
 
@@ -51,6 +52,7 @@ def build_parser() -> ArgumentParser:
         subparsers,
         command="submit",
         help_text="Project a local jj stack onto GitHub pull requests.",
+        handler=_submit_handler,
     )
     _add_revision_command(
         subparsers,
@@ -139,6 +141,30 @@ def _status_handler(args: Namespace) -> int:
         print(
             f"- {revision.subject} [{revision.change_id[:12]}] "
             f"-> {bookmark.bookmark} ({bookmark.source})"
+        )
+    return 0
+
+
+def _submit_handler(args: Namespace) -> int:
+    context = bootstrap_context(args)
+    result = run_submit(
+        change_overrides=context.config.change,
+        config=context.config.repo,
+        repo_root=context.repo_root,
+        revset=args.revset,
+    )
+    print(f"Selected revset: {result.selected_revset}")
+    print(f"Selected remote: {result.remote.name}")
+    print(f"Trunk: {result.trunk_subject}")
+    if not result.revisions:
+        print("No reviewable commits between the selected revision and `trunk()`.")
+        return 0
+
+    print("Projected review bookmarks:")
+    for revision in result.revisions:
+        print(
+            f"- {revision.subject} [{revision.change_id[:12]}] -> {revision.bookmark} "
+            f"({revision.bookmark_source}, {revision.remote_action})"
         )
     return 0
 

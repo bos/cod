@@ -6,15 +6,19 @@ import json
 import shlex
 import subprocess
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from jj_review.errors import CliError
+from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.stack import LocalRevision, LocalStack
 
 _COMMIT_TEMPLATE = (
     r'json(self) ++ "\t" ++ json(empty) ++ "\t" ++ json(divergent) ++ "\t" ++ '
     r'json(current_working_copy) ++ "\t" ++ json(immutable) ++ "\n"'
 )
+_BOOKMARK_TEMPLATE = r'json(self) ++ "\n"'
 
 
 class JjCommandError(CliError):
@@ -30,6 +34,12 @@ class UnsupportedStackError(CliError):
 
 
 type JjRunner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
+
+
+@dataclass(slots=True)
+class _RawBookmarkState:
+    local_targets: tuple[str, ...] = ()
+    remote_targets: list[RemoteBookmarkState] = field(default_factory=list)
 
 
 class JjClient:
@@ -133,6 +143,92 @@ class JjClient:
         revisions = self._query_revisions(f"children('{commit_id}')")
         return [revision for revision in revisions if revision.is_reviewable()]
 
+    def list_git_remotes(self) -> tuple[GitRemote, ...]:
+        """List configured Git remotes for the repository."""
+
+        stdout = self._run(("git", "remote", "list"))
+        remotes: list[GitRemote] = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            name, url = stripped.split(maxsplit=1)
+            remotes.append(GitRemote(name=name, url=url))
+        return tuple(remotes)
+
+    def get_bookmark_state(self, bookmark: str) -> BookmarkState:
+        """Return local and remote state for the named bookmark."""
+
+        return self.list_bookmark_states((bookmark,)).get(bookmark, BookmarkState(name=bookmark))
+
+    def list_bookmark_states(
+        self,
+        bookmarks: Sequence[str] | None = None,
+    ) -> dict[str, BookmarkState]:
+        """Return local and remote state for the requested bookmark names."""
+
+        command = ["bookmark", "list", "--all-remotes", "-T", _BOOKMARK_TEMPLATE]
+        if bookmarks:
+            command.extend(bookmarks)
+
+        stdout = self._run(command)
+        grouped: dict[str, _RawBookmarkState] = {}
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            raw_bookmark = json.loads(stripped)
+            if not isinstance(raw_bookmark, dict):
+                raise JjCommandError(
+                    "Unexpected `jj bookmark list` payload: expected a JSON object."
+                )
+            name = raw_bookmark["name"]
+            if not isinstance(name, str):
+                raise JjCommandError(
+                    "Unexpected `jj bookmark list` payload: missing bookmark name."
+                )
+            bookmark_state = grouped.setdefault(name, _RawBookmarkState())
+            targets = tuple(_require_sequence(raw_bookmark.get("target", ())))
+            remote_name = raw_bookmark.get("remote")
+            if remote_name is None:
+                bookmark_state.local_targets = targets
+                continue
+            if not isinstance(remote_name, str):
+                raise JjCommandError(
+                    "Unexpected `jj bookmark list` payload: invalid remote bookmark entry."
+                )
+            tracking_target = raw_bookmark.get("tracking_target", ())
+            bookmark_state.remote_targets.append(
+                RemoteBookmarkState(
+                    remote=remote_name,
+                    targets=targets,
+                    tracking_targets=tuple(_require_sequence(tracking_target)),
+                )
+            )
+
+        states = {
+            name: BookmarkState(
+                name=name,
+                local_targets=raw_state.local_targets,
+                remote_targets=tuple(raw_state.remote_targets),
+            )
+            for name, raw_state in grouped.items()
+        }
+        if bookmarks:
+            for bookmark in bookmarks:
+                states.setdefault(bookmark, BookmarkState(name=bookmark))
+        return states
+
+    def set_bookmark(self, bookmark: str, revision: str) -> None:
+        """Create or move a local bookmark to the supplied revision."""
+
+        self._run(("bookmark", "set", bookmark, "-r", revision))
+
+    def push_bookmark(self, *, remote: str, bookmark: str) -> None:
+        """Push one bookmark to the selected remote."""
+
+        self._run(("git", "push", "--remote", remote, "--bookmark", bookmark))
+
     def _query_revisions(self, revset: str, *, limit: int | None = None) -> list[LocalRevision]:
         command = ["log", "--no-graph", "-r", revset, "-T", _COMMIT_TEMPLATE]
         if limit is not None:
@@ -205,3 +301,9 @@ def _parse_revision_line(line: str) -> LocalRevision:
         immutable=json.loads(immutable_json),
         parents=tuple(commit["parents"]),
     )
+
+
+def _require_sequence(value: Any) -> Sequence[str]:
+    if not isinstance(value, list | tuple):
+        raise JjCommandError("Unexpected `jj bookmark list` payload: expected a sequence.")
+    return tuple(str(item) for item in value)

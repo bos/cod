@@ -524,6 +524,8 @@ Done when:
 
 ### Slice 4: Remote Branch Projection
 
+Status: complete.
+
 Deliver:
 
 - push/move synthetic review bookmarks
