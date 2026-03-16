@@ -24,12 +24,13 @@ from jj_review.config import ChangeConfig, RepoConfig
 from jj_review.errors import CliError
 from jj_review.github.client import GithubClient, GithubClientError
 from jj_review.jj import JjClient
-from jj_review.models.bookmarks import GitRemote, RemoteBookmarkState
+from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
 from jj_review.models.github import GithubIssueComment, GithubPullRequest
 from jj_review.models.stack import LocalRevision, LocalStack
 
 logger = logging.getLogger(__name__)
+_GITHUB_INSPECTION_CONCURRENCY = 4
 
 PullRequestLookupState = Literal["ambiguous", "closed", "error", "missing", "open"]
 StackCommentLookupState = Literal["ambiguous", "error", "missing", "present"]
@@ -464,61 +465,105 @@ async def _inspect_revisions_with_github(
     prepared: _PreparedStack,
     raise_on_lookup_error: bool,
 ) -> tuple[ReviewStatusRevision, ...]:
+    bookmark_states = prepared.client.list_bookmark_states(
+        [revision.bookmark for revision in prepared.status_revisions]
+    )
     async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
-        revisions: list[ReviewStatusRevision] = []
-        for prepared_revision in prepared.status_revisions:
-            bookmark_state = prepared.client.get_bookmark_state(prepared_revision.bookmark)
-            remote_state = (
-                bookmark_state.remote_target(prepared.remote.name)
-                if prepared.remote
-                else None
-            )
-            head_label = f"{github_repository.owner}:{prepared_revision.bookmark}"
-            pull_request_lookup = await _inspect_pull_request(
-                github_client=github_client,
-                github_repository=github_repository,
-                head_label=head_label,
-            )
-            if raise_on_lookup_error:
-                _ensure_syncable_pull_request(
-                    bookmark=prepared_revision.bookmark,
-                    cached_change=prepared_revision.cached_change,
-                    pull_request_lookup=pull_request_lookup,
-                )
-            stack_comment_lookup: StackCommentLookup | None = None
-            if pull_request_lookup.state == "open":
-                pull_request = pull_request_lookup.pull_request
-                if pull_request is None:
-                    raise AssertionError("Open pull request lookup must include a pull request.")
-                stack_comment_lookup = await _inspect_stack_comment(
+        revisions: list[ReviewStatusRevision | None] = [
+            None for _ in prepared.status_revisions
+        ]
+        semaphore = asyncio.Semaphore(_GITHUB_INSPECTION_CONCURRENCY)
+        await asyncio.gather(
+            *(
+                _inspect_revision_with_github(
+                    bookmark_states=bookmark_states,
                     github_client=github_client,
                     github_repository=github_repository,
+                    index=index,
+                    prepared=prepared,
+                    prepared_revision=prepared_revision,
+                    raise_on_lookup_error=raise_on_lookup_error,
+                    revisions=revisions,
+                    semaphore=semaphore,
+                )
+                for index, prepared_revision in enumerate(prepared.status_revisions)
+            )
+        )
+
+    return tuple(_require_inspected_revision(revision) for revision in revisions)
+
+
+async def _inspect_revision_with_github(
+    *,
+    bookmark_states: dict[str, BookmarkState],
+    github_client: GithubClient,
+    github_repository,
+    index: int,
+    prepared: _PreparedStack,
+    prepared_revision: _PreparedRevision,
+    raise_on_lookup_error: bool,
+    revisions: list[ReviewStatusRevision | None],
+    semaphore: asyncio.Semaphore,
+) -> None:
+    async with semaphore:
+        bookmark_state = bookmark_states.get(
+            prepared_revision.bookmark,
+            BookmarkState(name=prepared_revision.bookmark),
+        )
+        remote_state = (
+            bookmark_state.remote_target(prepared.remote.name)
+            if prepared.remote
+            else None
+        )
+        head_label = f"{github_repository.owner}:{prepared_revision.bookmark}"
+        pull_request_lookup = await _inspect_pull_request(
+            github_client=github_client,
+            github_repository=github_repository,
+            head_label=head_label,
+        )
+        if raise_on_lookup_error:
+            _ensure_syncable_pull_request(
+                bookmark=prepared_revision.bookmark,
+                cached_change=prepared_revision.cached_change,
+                pull_request_lookup=pull_request_lookup,
+            )
+        stack_comment_lookup: StackCommentLookup | None = None
+        if pull_request_lookup.state == "open":
+            pull_request = pull_request_lookup.pull_request
+            if pull_request is None:
+                raise AssertionError("Open pull request lookup must include a pull request.")
+            stack_comment_lookup = await _inspect_stack_comment(
+                github_client=github_client,
+                github_repository=github_repository,
+                pull_request_number=pull_request.number,
+            )
+            if raise_on_lookup_error:
+                _ensure_syncable_stack_comment(
                     pull_request_number=pull_request.number,
-                )
-                if raise_on_lookup_error:
-                    _ensure_syncable_stack_comment(
-                        pull_request_number=pull_request.number,
-                        stack_comment_lookup=stack_comment_lookup,
-                    )
-            logger.debug(
-                "status revision inspected: change_id=%s bookmark=%s pr_state=%s",
-                prepared_revision.revision.change_id[:12],
-                prepared_revision.bookmark,
-                pull_request_lookup.state,
-            )
-            revisions.append(
-                ReviewStatusRevision(
-                    bookmark=prepared_revision.bookmark,
-                    bookmark_source=prepared_revision.bookmark_source,
-                    cached_change=prepared_revision.cached_change,
-                    change_id=prepared_revision.revision.change_id,
-                    pull_request_lookup=pull_request_lookup,
-                    remote_state=remote_state,
                     stack_comment_lookup=stack_comment_lookup,
-                    subject=prepared_revision.revision.subject,
                 )
-            )
-        return tuple(revisions)
+        logger.debug(
+            "status revision inspected: change_id=%s bookmark=%s pr_state=%s",
+            prepared_revision.revision.change_id[:12],
+            prepared_revision.bookmark,
+            pull_request_lookup.state,
+        )
+        revisions[index] = ReviewStatusRevision(
+            bookmark=prepared_revision.bookmark,
+            bookmark_source=prepared_revision.bookmark_source,
+            cached_change=prepared_revision.cached_change,
+            change_id=prepared_revision.revision.change_id,
+            pull_request_lookup=pull_request_lookup,
+            remote_state=remote_state,
+            stack_comment_lookup=stack_comment_lookup,
+            subject=prepared_revision.revision.subject,
+        )
+
+
+def _require_inspected_revision(revision: ReviewStatusRevision | None) -> ReviewStatusRevision:
+    if revision is None:
+        raise AssertionError("GitHub inspection did not populate every prepared revision.")
+    return revision
 
 
 async def _inspect_pull_request(

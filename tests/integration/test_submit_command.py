@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -324,6 +325,69 @@ def test_status_prints_stack_tip_first_like_jj_log(
     feature_2_line = captured.out.index("- feature 2 [")
     feature_1_line = captured.out.index("- feature 1 [")
     assert feature_2_line < feature_1_line
+
+
+def test_status_limits_concurrent_github_lookups(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    for index in range(4):
+        _commit(repo, f"feature {index + 1}", f"feature-{index + 1}.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    app = create_app(FakeGithubState.single_repository(fake_repo))
+    max_in_flight = 0
+    in_flight = 0
+
+    class TrackingGithubClient(GithubClient):
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ) -> tuple:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            try:
+                await asyncio.sleep(0.02)
+                return await super().list_pull_requests(
+                    owner,
+                    repo,
+                    head=head,
+                    state=state,
+                )
+            finally:
+                in_flight -= 1
+
+    def build_github_client(*, base_url: str) -> GithubClient:
+        return TrackingGithubClient(
+            base_url=base_url,
+            transport=httpx.ASGITransport(app=app),
+        )
+
+    monkeypatch.setattr(
+        "jj_review.commands.review_state._GITHUB_INSPECTION_CONCURRENCY",
+        2,
+    )
+    monkeypatch.setattr(
+        "jj_review.commands.review_state._build_github_client",
+        build_github_client,
+    )
+
+    exit_code = _main(repo, config_path, "status")
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert f"GitHub: {fake_repo.owner}/{fake_repo.name}" in captured.out
+    assert max_in_flight == 2
 
 
 def test_status_preserves_remote_observations_when_github_lookup_fails(
