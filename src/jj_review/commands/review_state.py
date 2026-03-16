@@ -463,7 +463,10 @@ async def _inspect_pull_request(
         )
     except GithubClientError as error:
         return PullRequestLookup(
-            message=f"Could not list pull requests for head {head_label!r}: {error}",
+            message=_summarize_github_lookup_error(
+                action="pull request lookup",
+                error=error,
+            ),
             pull_request=None,
             state="error",
         )
@@ -509,8 +512,9 @@ async def _inspect_stack_comment(
     except GithubClientError as error:
         return StackCommentLookup(
             comment=None,
-            message=(
-                f"Could not list stack comments for pull request #{pull_request_number}: {error}"
+            message=_summarize_github_lookup_error(
+                action=f"stack comment lookup for pull request #{pull_request_number}",
+                error=error,
             ),
             state="error",
         )
@@ -572,3 +576,11 @@ def _ensure_syncable_stack_comment(
     raise SyncResolutionError(
         f"{message} Repair the linkage before syncing pull request #{pull_request_number} again."
     )
+
+
+def _summarize_github_lookup_error(*, action: str, error: GithubClientError) -> str:
+    """Render a concise GitHub lookup failure for `status` and `sync` output."""
+
+    if error.status_code is None:
+        return f"{action} failed"
+    return f"{action} failed (GitHub {error.status_code})"

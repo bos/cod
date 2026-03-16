@@ -325,7 +325,10 @@ def test_status_preserves_remote_observations_when_github_lookup_fails(
             head: str,
             state: str = "all",
         ) -> tuple:
-            raise GithubClientError("GitHub request failed: 503 Service Unavailable")
+            raise GithubClientError(
+                'GitHub request failed: 404 {"message":"Not Found","documentation_url":"x"}',
+                status_code=404,
+            )
 
     def build_github_client(*, base_url: str) -> GithubClient:
         return FailingPullRequestLookupClient(
@@ -342,7 +345,8 @@ def test_status_preserves_remote_observations_when_github_lookup_fails(
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "Could not list pull requests for head" in captured.out
+    assert "pull request lookup failed (GitHub 404)" in captured.out
+    assert "documentation_url" not in captured.out
     assert "remote origin tracked" in captured.out
 
 
