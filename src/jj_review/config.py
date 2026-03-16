@@ -54,7 +54,7 @@ class LoggingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     http_debug: bool = False
-    level: str = "INFO"
+    level: str = "WARNING"
 
 
 class AppConfig(BaseModel):

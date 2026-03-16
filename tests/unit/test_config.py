@@ -13,7 +13,7 @@ def test_load_config_returns_defaults_when_config_is_missing(
 
     config = load_config(repo_root=tmp_path)
 
-    assert config.logging.level == "INFO"
+    assert config.logging.level == "WARNING"
     assert config.repo.github_host == "github.com"
     assert config.repo.remote is None
 
