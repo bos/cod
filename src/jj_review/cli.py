@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from argparse import ArgumentParser, Namespace, _SubParsersAction
+from argparse import SUPPRESS, ArgumentParser, Namespace, _SubParsersAction
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -20,24 +20,11 @@ logger = logging.getLogger(__name__)
 def build_parser() -> ArgumentParser:
     """Build the top-level CLI parser and subcommands."""
 
+    common_options = _build_common_options_parser()
     parser = ArgumentParser(
         prog="jj-review",
         description="JJ-native stacked GitHub review tooling.",
-    )
-    parser.add_argument(
-        "--repository",
-        type=Path,
-        help="Workspace path to operate on. Defaults to the current directory.",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="Explicit path to a TOML config file.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging.",
+        parents=[common_options],
     )
     parser.add_argument(
         "--version",
@@ -51,23 +38,27 @@ def build_parser() -> ArgumentParser:
         command="submit",
         help_text="Project a local jj stack onto GitHub pull requests.",
         handler=_submit_handler,
+        parents=[common_options],
     )
     _add_revision_command(
         subparsers,
         command="status",
         help_text="Show cached and remote review state for a stack.",
         handler=_status_handler,
+        parents=[common_options],
     )
     _add_revision_command(
         subparsers,
         command="sync",
         help_text="Refresh cached review linkage from GitHub.",
         handler=_sync_handler,
+        parents=[common_options],
     )
 
     adopt_parser = subparsers.add_parser(
         "adopt",
         help="Associate an existing pull request with a local change.",
+        parents=[common_options],
     )
     adopt_parser.add_argument("pull_request", help="Pull request number or URL.")
     adopt_parser.add_argument(
@@ -80,6 +71,7 @@ def build_parser() -> ArgumentParser:
     cleanup_parser = subparsers.add_parser(
         "cleanup",
         help="Report or apply conservative review cleanup actions.",
+        parents=[common_options],
     )
     cleanup_parser.set_defaults(handler=_stub_handler("cleanup"))
     return parser
@@ -100,6 +92,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (BootstrapError, CliError) as error:
         print(error, file=sys.stderr)
         return error.exit_code
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
 
 
 def _add_revision_command(
@@ -108,10 +103,34 @@ def _add_revision_command(
     command: str,
     help_text: str,
     handler=None,
+    parents=None,
 ) -> None:
-    parser = subparsers.add_parser(command, help=help_text)
+    parser = subparsers.add_parser(command, help=help_text, parents=parents or [])
     parser.add_argument("revset", nargs="?", help="Revision to operate on.")
     parser.set_defaults(handler=handler or _stub_handler(command))
+
+
+def _build_common_options_parser() -> ArgumentParser:
+    parser = ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        default=SUPPRESS,
+        help="Workspace path to operate on. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=SUPPRESS,
+        help="Explicit path to a TOML config file.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=SUPPRESS,
+        help="Enable debug logging.",
+    )
+    return parser
 
 
 def _status_handler(args: Namespace) -> int:

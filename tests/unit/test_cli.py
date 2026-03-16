@@ -1,6 +1,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,55 @@ def test_main_reports_invalid_logging_level_without_traceback(
     assert exit_code == 1
     assert "Invalid logging level" in captured.err
     assert "DEBIG" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_accepts_global_options_after_subcommand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+    monkeypatch.setattr(
+        "jj_review.cli.run_status",
+        lambda **kwargs: SimpleNamespace(
+            github_error=None,
+            github_repository=None,
+            incomplete=False,
+            remote=None,
+            remote_error=None,
+            revisions=(),
+            selected_revset="@",
+            trunk_subject="base",
+        ),
+    )
+
+    exit_code = main(["status", "--debug", "--repository", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Selected revset: @" in captured.out
+    assert "No reviewable commits" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_main_reports_keyboard_interrupt_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+    monkeypatch.setattr(
+        "jj_review.cli.run_status",
+        lambda **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    exit_code = main(["status", "--repository", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 130
+    assert captured.out == ""
+    assert captured.err.strip() == "Interrupted."
     assert "Traceback" not in captured.err
 
 
