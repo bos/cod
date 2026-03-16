@@ -38,3 +38,13 @@ class GithubPullRequest(BaseModel):
     number: int
     state: str
     title: str
+
+
+class GithubIssueComment(BaseModel):
+    """Subset of issue-comment fields used by the client."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    body: str
+    html_url: str
+    id: int

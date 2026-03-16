@@ -6,11 +6,15 @@ from typing import Any
 
 import httpx
 
-from jj_review.models.github import GithubPullRequest, GithubRepository
+from jj_review.models.github import GithubIssueComment, GithubPullRequest, GithubRepository
 
 
 class GithubClientError(RuntimeError):
     """Raised when GitHub returns a non-success response."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GithubClient:
@@ -83,6 +87,49 @@ class GithubClient:
         )
         return GithubPullRequest.model_validate(self._expect_success(response))
 
+    async def list_issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        issue_number: int,
+    ) -> tuple[GithubIssueComment, ...]:
+        response = await self._client.get(
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
+        )
+        payload = self._expect_success(response)
+        if not isinstance(payload, list):
+            raise GithubClientError("GitHub issue comment list response was not a JSON array.")
+        return tuple(GithubIssueComment.model_validate(item) for item in payload)
+
+    async def create_issue_comment(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        issue_number: int,
+        body: str,
+    ) -> GithubIssueComment:
+        response = await self._client.post(
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
+            json={"body": body},
+        )
+        return GithubIssueComment.model_validate(self._expect_success(response))
+
+    async def update_issue_comment(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        comment_id: int,
+        body: str,
+    ) -> GithubIssueComment:
+        response = await self._client.patch(
+            f"/repos/{owner}/{repo}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+        return GithubIssueComment.model_validate(self._expect_success(response))
+
     async def update_pull_request(
         self,
         owner: str,
@@ -104,6 +151,7 @@ class GithubClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             raise GithubClientError(
-                f"GitHub request failed: {error.response.status_code} {error.response.text}"
+                f"GitHub request failed: {error.response.status_code} {error.response.text}",
+                status_code=error.response.status_code,
             ) from error
         return response.json()

@@ -17,7 +17,7 @@ from jj_review.github.client import GithubClient, GithubClientError
 from jj_review.jj import JjClient
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
-from jj_review.models.github import GithubPullRequest, GithubRepository
+from jj_review.models.github import GithubIssueComment, GithubPullRequest, GithubRepository
 
 
 class SubmitRemoteResolutionError(CliError):
@@ -52,10 +52,15 @@ class SubmitPullRequestResolutionError(CliError):
     """Raised when `submit` cannot safely resolve a pull request."""
 
 
+class SubmitStackCommentError(CliError):
+    """Raised when `submit` cannot create or update stack metadata comments."""
+
+
 LocalBookmarkAction = Literal["created", "moved", "unchanged"]
 PullRequestAction = Literal["created", "unchanged", "updated"]
 RemoteBookmarkAction = Literal["pushed", "up to date"]
 _DEFAULT_GITHUB_HOST = "github.com"
+_STACK_COMMENT_MARKER = "<!-- jj-review-stack -->"
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +285,15 @@ async def _run_submit_async(
                     subject=revision.subject,
                 )
             )
+
+        await _sync_stack_comments(
+            github_client=github_client,
+            github_repository=github_repository,
+            revisions=tuple(revisions),
+            state=state,
+            state_changes=state_changes,
+            trunk_branch=trunk_branch,
+        )
 
     next_state = bookmark_result.state.model_copy(update={"changes": state_changes})
     if bookmark_result.changed or next_state != state:
@@ -680,6 +694,197 @@ async def _update_pull_request(
         raise SubmitPullRequestResolutionError(
             f"Could not update pull request #{pull_request.number}: {error}"
         ) from error
+
+
+async def _sync_stack_comments(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    revisions: tuple[SubmittedRevision, ...],
+    state: ReviewState,
+    state_changes: dict[str, CachedChange],
+    trunk_branch: str,
+) -> None:
+    for index, revision in enumerate(revisions):
+        cached_change = state_changes.get(revision.change_id) or state.changes.get(
+            revision.change_id
+        )
+        if cached_change is None:
+            raise AssertionError("Stack comments require cached pull request linkage.")
+        comment_body = _render_stack_comment(
+            current=revision,
+            next_revision=revisions[index + 1] if index + 1 < len(revisions) else None,
+            previous=revisions[index - 1] if index > 0 else None,
+            trunk_branch=trunk_branch,
+        )
+        comment = await _upsert_stack_comment(
+            cached_change=cached_change,
+            comment_body=comment_body,
+            github_client=github_client,
+            github_repository=github_repository,
+            pull_request_number=revision.pull_request_number,
+        )
+        state_changes[revision.change_id] = cached_change.model_copy(
+            update={"stack_comment_id": comment.id}
+        )
+
+
+async def _upsert_stack_comment(
+    *,
+    cached_change: CachedChange,
+    comment_body: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    pull_request_number: int,
+) -> GithubIssueComment:
+    comments = await _list_issue_comments(
+        github_client=github_client,
+        github_repository=github_repository,
+        pull_request_number=pull_request_number,
+    )
+    if cached_change.stack_comment_id is not None:
+        cached_comment = next(
+            (
+                comment
+                for comment in comments
+                if comment.id == cached_change.stack_comment_id
+            ),
+            None,
+        )
+        if cached_comment is not None:
+            if _STACK_COMMENT_MARKER not in cached_comment.body:
+                raise SubmitStackCommentError(
+                    f"Cached stack comment #{cached_change.stack_comment_id} for pull "
+                    f"request #{pull_request_number} is not managed by `jj-review`. "
+                    "Repair the linkage with `sync` or delete the cached comment ID "
+                    "before submitting again."
+                )
+            if cached_comment.body == comment_body:
+                return cached_comment
+            return await _update_stack_comment(
+                comment_body=comment_body,
+                comment_id=cached_change.stack_comment_id,
+                github_client=github_client,
+                github_repository=github_repository,
+            )
+
+    discovered_comment = await _discover_stack_comment(
+        comments=comments,
+    )
+    if discovered_comment is None:
+        return await _create_stack_comment(
+            comment_body=comment_body,
+            github_client=github_client,
+            github_repository=github_repository,
+            pull_request_number=pull_request_number,
+        )
+    if discovered_comment.body == comment_body:
+        return discovered_comment
+    return await _update_stack_comment(
+        comment_body=comment_body,
+        comment_id=discovered_comment.id,
+        github_client=github_client,
+        github_repository=github_repository,
+    )
+
+
+async def _list_issue_comments(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    pull_request_number: int,
+) -> tuple[GithubIssueComment, ...]:
+    try:
+        return await github_client.list_issue_comments(
+            github_repository.owner,
+            github_repository.repo,
+            issue_number=pull_request_number,
+        )
+    except GithubClientError as error:
+        raise SubmitStackCommentError(
+            f"Could not list stack comments for pull request #{pull_request_number}: {error}"
+        ) from error
+
+
+async def _discover_stack_comment(
+    *,
+    comments: tuple[GithubIssueComment, ...],
+) -> GithubIssueComment | None:
+    matching_comments = [
+        comment for comment in comments if _STACK_COMMENT_MARKER in comment.body
+    ]
+    if not matching_comments:
+        return None
+    return max(matching_comments, key=lambda comment: comment.id)
+
+
+async def _create_stack_comment(
+    *,
+    comment_body: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    pull_request_number: int,
+) -> GithubIssueComment:
+    try:
+        return await github_client.create_issue_comment(
+            github_repository.owner,
+            github_repository.repo,
+            issue_number=pull_request_number,
+            body=comment_body,
+        )
+    except GithubClientError as error:
+        raise SubmitStackCommentError(
+            f"Could not create a stack comment for pull request #{pull_request_number}: "
+            f"{error}"
+        ) from error
+
+
+async def _update_stack_comment(
+    *,
+    comment_body: str,
+    comment_id: int,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+) -> GithubIssueComment:
+    return await github_client.update_issue_comment(
+        github_repository.owner,
+        github_repository.repo,
+        comment_id=comment_id,
+        body=comment_body,
+    )
+
+
+def _render_stack_comment(
+    *,
+    current: SubmittedRevision,
+    next_revision: SubmittedRevision | None,
+    previous: SubmittedRevision | None,
+    trunk_branch: str,
+) -> str:
+    return "\n".join(
+        [
+            _STACK_COMMENT_MARKER,
+            "This pull request is part of a stack managed by `jj-review`.",
+            "",
+            f"Previous: {_render_stack_neighbor(previous, fallback=f'trunk `{trunk_branch}`')}",
+            f"Current: {_render_pull_request_reference(current)}",
+            f"Next: {_render_stack_neighbor(next_revision, fallback='none')}",
+        ]
+    )
+
+
+def _render_stack_neighbor(
+    revision: SubmittedRevision | None,
+    *,
+    fallback: str,
+) -> str:
+    if revision is None:
+        return fallback
+    return _render_pull_request_reference(revision)
+
+
+def _render_pull_request_reference(revision: SubmittedRevision) -> str:
+    return f"[#{revision.pull_request_number}]({revision.pull_request_url}) {revision.subject}"
 
 
 def _pull_request_body(description: str) -> str:

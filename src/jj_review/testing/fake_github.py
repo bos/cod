@@ -40,6 +40,30 @@ class FakeGithubPullRequest:
 
 
 @dataclass(slots=True)
+class FakeGithubIssueComment:
+    """Mutable issue comment state served by the fake API."""
+
+    body: str
+    id: int
+    issue_number: int
+
+    def to_payload(
+        self,
+        *,
+        repository: FakeGithubRepository,
+        web_origin: str,
+    ) -> dict[str, object]:
+        return {
+            "body": self.body,
+            "html_url": (
+                f"{web_origin}/{repository.full_name}/issues/{self.issue_number}"
+                f"#issuecomment-{self.id}"
+            ),
+            "id": self.id,
+        }
+
+
+@dataclass(slots=True)
 class FakeGithubRepository:
     """Repository metadata plus its backing bare Git repository."""
 
@@ -47,7 +71,9 @@ class FakeGithubRepository:
     git_dir: Path
     name: str
     owner: str
+    next_issue_comment_id: int = 1
     next_pull_request_number: int = 1
+    issue_comments: dict[int, list[FakeGithubIssueComment]] = field(default_factory=dict)
     pull_requests: dict[int, FakeGithubPullRequest] = field(default_factory=dict)
 
     @property
@@ -85,6 +111,43 @@ class FakeGithubRepository:
         )
         self.pull_requests[number] = pull_request
         return pull_request
+
+    def list_issue_comments(self, issue_number: int) -> list[FakeGithubIssueComment]:
+        self._require_issue_number(issue_number)
+        return list(self.issue_comments.get(issue_number, ()))
+
+    def create_issue_comment(
+        self,
+        *,
+        body: str,
+        issue_number: int,
+    ) -> FakeGithubIssueComment:
+        self._require_issue_number(issue_number)
+        comment = FakeGithubIssueComment(
+            body=body,
+            id=self.next_issue_comment_id,
+            issue_number=issue_number,
+        )
+        self.next_issue_comment_id += 1
+        self.issue_comments.setdefault(issue_number, []).append(comment)
+        return comment
+
+    def update_issue_comment(
+        self,
+        *,
+        body: str,
+        comment_id: int,
+    ) -> FakeGithubIssueComment | None:
+        for comments in self.issue_comments.values():
+            for comment in comments:
+                if comment.id == comment_id:
+                    comment.body = body
+                    return comment
+        return None
+
+    def _require_issue_number(self, issue_number: int) -> None:
+        if issue_number not in self.pull_requests:
+            raise HTTPException(status_code=404, detail="Not Found")
 
 
 @dataclass(slots=True, frozen=True)
@@ -180,6 +243,49 @@ def create_app(fake_state: FakeGithubState) -> FastAPI:
             pull_request.base_ref = _require_string(payload, "base")
             _require_branch(repository, pull_request.base_ref)
         return pull_request.to_payload(repository=repository, web_origin=fake_state.web_origin)
+
+    @app.get("/repos/{owner}/{repo}/issues/{issue_number}/comments")
+    async def list_issue_comments(
+        owner: str,
+        repo: str,
+        issue_number: int,
+    ) -> list[dict[str, object]]:
+        repository = _get_repository(fake_state, owner, repo)
+        comments = repository.list_issue_comments(issue_number)
+        return [
+            comment.to_payload(repository=repository, web_origin=fake_state.web_origin)
+            for comment in sorted(comments, key=lambda candidate: candidate.id)
+        ]
+
+    @app.post("/repos/{owner}/{repo}/issues/{issue_number}/comments", status_code=201)
+    async def create_issue_comment(
+        owner: str,
+        repo: str,
+        issue_number: int,
+        payload: Annotated[dict[str, object], Body(...)],
+    ) -> dict[str, object]:
+        repository = _get_repository(fake_state, owner, repo)
+        comment = repository.create_issue_comment(
+            body=_require_string(payload, "body"),
+            issue_number=issue_number,
+        )
+        return comment.to_payload(repository=repository, web_origin=fake_state.web_origin)
+
+    @app.patch("/repos/{owner}/{repo}/issues/comments/{comment_id}")
+    async def update_issue_comment(
+        owner: str,
+        repo: str,
+        comment_id: int,
+        payload: Annotated[dict[str, object], Body(...)],
+    ) -> dict[str, object]:
+        repository = _get_repository(fake_state, owner, repo)
+        comment = repository.update_issue_comment(
+            body=_require_string(payload, "body"),
+            comment_id=comment_id,
+        )
+        if comment is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return comment.to_payload(repository=repository, web_origin=fake_state.web_origin)
 
     return app
 

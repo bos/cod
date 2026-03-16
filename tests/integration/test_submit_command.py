@@ -52,6 +52,124 @@ def test_submit_projects_review_bookmarks_to_selected_remote(
     assert fake_repo.pull_requests[2].base_ref == first_bookmark
 
 
+def test_submit_creates_stack_comments_for_each_pull_request(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+    _commit(repo, "feature 2", "feature-2.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+    state = ReviewStateStore.for_repo(repo).load()
+
+    assert len(_issue_comments(fake_repo, 1)) == 1
+    assert len(_issue_comments(fake_repo, 2)) == 1
+    assert "<!-- jj-review-stack -->" in _issue_comments(fake_repo, 1)[0].body
+    assert "Previous: trunk `main`" in _issue_comments(fake_repo, 1)[0].body
+    assert "Next: [#2](https://github.test/octo-org/stacked-review/pull/2) feature 2" in (
+        _issue_comments(fake_repo, 1)[0].body
+    )
+    assert "Previous: [#1](https://github.test/octo-org/stacked-review/pull/1) feature 1" in (
+        _issue_comments(fake_repo, 2)[0].body
+    )
+    assert "Next: none" in _issue_comments(fake_repo, 2)[0].body
+    assert {change.stack_comment_id for change in state.changes.values()} == {1, 2}
+
+
+def test_submit_rediscovers_and_regenerates_stack_comments_when_cache_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+    _commit(repo, "feature 2", "feature-2.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    top_change_id = stack.revisions[-1].change_id
+    bottom_change_id = stack.revisions[0].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    initial_state = state_store.load()
+    initial_comment_id = initial_state.changes[top_change_id].stack_comment_id
+    assert initial_comment_id is not None
+
+    fake_repo.issue_comments[2][0].body = "<!-- jj-review-stack -->\nmanually edited"
+    state_store.save(
+        initial_state.model_copy(
+            update={
+                "changes": {
+                    **initial_state.changes,
+                    top_change_id: initial_state.changes[top_change_id].model_copy(
+                        update={"stack_comment_id": None}
+                    ),
+                }
+            }
+        )
+    )
+
+    _run(["jj", "describe", "-r", top_change_id, "-m", "feature 2 renamed"], repo)
+
+    assert _main(repo, config_path, "submit", top_change_id) == 0
+    capsys.readouterr()
+    refreshed_state = state_store.load()
+
+    assert len(_issue_comments(fake_repo, 2)) == 1
+    assert _issue_comments(fake_repo, 2)[0].id == initial_comment_id
+    assert "Current: [#2](https://github.test/octo-org/stacked-review/pull/2) " in (
+        _issue_comments(fake_repo, 2)[0].body
+    )
+    assert "feature 2 renamed" in _issue_comments(fake_repo, 2)[0].body
+    assert "feature 2 renamed" in _issue_comments(fake_repo, 1)[0].body
+    assert refreshed_state.changes[top_change_id].stack_comment_id == initial_comment_id
+    assert refreshed_state.changes[bottom_change_id].stack_comment_id == 1
+
+
+def test_submit_rejects_cached_stack_comment_id_for_non_stack_comment(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    change_id = stack.revisions[-1].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    initial_state = state_store.load()
+    fake_repo.create_issue_comment(body="manual note", issue_number=1)
+    state_store.save(
+        initial_state.model_copy(
+            update={
+                "changes": {
+                    **initial_state.changes,
+                    change_id: initial_state.changes[change_id].model_copy(
+                        update={"stack_comment_id": 2}
+                    ),
+                }
+            }
+        )
+    )
+
+    exit_code = _main(repo, config_path, "submit", change_id)
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "is not managed by `jj-review`" in captured.err
+    assert fake_repo.issue_comments[1][1].body == "manual note"
+
+
 def test_submit_reports_up_to_date_when_remote_bookmark_and_pr_already_match(
     tmp_path: Path,
     monkeypatch,
@@ -304,6 +422,10 @@ def _init_repo(tmp_path: Path) -> tuple[Path, FakeGithubRepository]:
 def _commit(repo: Path, message: str, filename: str) -> None:
     _write_file(repo / filename, f"{message}\n")
     _run(["jj", "commit", "-m", message], repo)
+
+
+def _issue_comments(fake_repo: FakeGithubRepository, issue_number: int):
+    return fake_repo.issue_comments.get(issue_number, [])
 
 
 def _read_remote_ref(remote: Path, bookmark: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,37 @@ async def _fetch_repository(app: FastAPI) -> tuple[str, str]:
     return repository.full_name, repository.default_branch
 
 
+async def _round_trip_issue_comment(app: FastAPI) -> tuple[str, str]:
+    transport = httpx.ASGITransport(app=app)
+    async with GithubClient(base_url="https://api.github.test", transport=transport) as client:
+        pull_request = await client.create_pull_request(
+            "octo-org",
+            "stacked-review",
+            base="main",
+            body="body",
+            head="feature",
+            title="feature",
+        )
+        created = await client.create_issue_comment(
+            "octo-org",
+            "stacked-review",
+            issue_number=pull_request.number,
+            body="first body",
+        )
+        listed = await client.list_issue_comments(
+            "octo-org",
+            "stacked-review",
+            issue_number=pull_request.number,
+        )
+        updated = await client.update_issue_comment(
+            "octo-org",
+            "stacked-review",
+            comment_id=created.id,
+            body="updated body",
+        )
+    return listed[0].body, updated.body
+
+
 def test_fake_github_repository_endpoint_round_trips_through_client(tmp_path: Path) -> None:
     fake_repo = initialize_bare_repository(
         tmp_path,
@@ -37,3 +69,62 @@ def test_fake_github_repository_endpoint_round_trips_through_client(tmp_path: Pa
     assert fake_repo.git_dir.is_dir()
     head_ref = (fake_repo.git_dir / "HEAD").read_text(encoding="utf-8").strip()
     assert head_ref == "ref: refs/heads/main"
+
+
+def test_fake_github_issue_comments_round_trip_through_client(tmp_path: Path) -> None:
+    fake_repo = initialize_bare_repository(
+        tmp_path,
+        owner="octo-org",
+        name="stacked-review",
+    )
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "init", str(worktree)], capture_output=True, check=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "user.name", "Test User"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "user.email", "test@example.com"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    (worktree / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(worktree), "add", "README.md"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", "base"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "remote", "add", "origin", str(fake_repo.git_dir)],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "push", "origin", "HEAD:main"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "push", "origin", "HEAD:feature"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    app = create_app(FakeGithubState.single_repository(fake_repo))
+
+    listed_body, updated_body = asyncio.run(_round_trip_issue_comment(app))
+
+    assert listed_body == "first body"
+    assert updated_body == "updated body"

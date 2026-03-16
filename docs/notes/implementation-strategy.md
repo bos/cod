@@ -569,12 +569,19 @@ Done when:
 
 ### Slice 6: Reviewer-Facing Stack Metadata
 
+Status: complete.
+
 Deliver:
 
 - dedicated bot comment support
 - comment creation immediately after PR creation
 - regeneration on every submit
 - caching of comment identifiers if needed
+
+Implemented with one dedicated PR comment per review unit, marked so `submit`
+can rediscover it when cached comment IDs are missing. The comment body is
+regenerated from the current submitted stack on every run and is never used as
+the source of truth for topology.
 
 Done when:
 
