@@ -69,7 +69,7 @@ def test_review_state_store_disables_persistence_when_repo_id_is_unavailable(
 
     monkeypatch.setattr("jj_review.cache.resolve_state_path", fail_resolve_state_path)
 
-    with caplog.at_level(logging.DEBUG):
+    with caplog.at_level(logging.DEBUG, logger="jj_review.cache"):
         store = ReviewStateStore.for_repo(repo)
         loaded_state = store.load()
         store.save(ReviewState())

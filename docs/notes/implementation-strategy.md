@@ -360,7 +360,13 @@ The default local verification command should be:
 ```
 
 That script should run `uv sync --locked`, then run `ruff check`, `ty check`,
-and `pytest` in sequence.
+and `pytest -n auto` by default, with randomized test order so hidden
+cross-test coupling is more likely to fail fast during normal local runs.
+
+When the full suite gets slow enough to justify it, `./check.py -n 4` should
+override the default worker count, while `./check.py -n 1` should provide a
+serial escape hatch without changing the environment bootstrap, lint, and
+type-check steps.
 
 Live tests should require an explicit flag and explicit credentials.
 

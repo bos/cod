@@ -9,6 +9,7 @@ import subprocess
 from argparse import ArgumentParser
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 
 def _venv_python_relative_path() -> Path:
@@ -19,11 +20,32 @@ def _venv_python_relative_path() -> Path:
 
 REPO_ROOT = Path(__file__).resolve().parent
 VENV_PYTHON = REPO_ROOT / ".venv" / _venv_python_relative_path()
-CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("ruff", ("-m", "ruff", "check")),
-    ("ty", ("-m", "ty", "check")),
-    ("pytest", ("-m", "pytest")),
-)
+PytestJobs = int | Literal["auto"]
+
+
+def _parse_pytest_jobs(value: str) -> PytestJobs:
+    if value == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise ValueError("--pytest-jobs must be a positive integer or 'auto'") from error
+    if parsed < 1:
+        raise ValueError("--pytest-jobs must be a positive integer or 'auto'")
+    return parsed
+
+
+def _build_checks(*, pytest_jobs: PytestJobs | None) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    pytest_command: tuple[str, ...] = ("-m", "pytest")
+    if pytest_jobs in (None, "auto"):
+        pytest_command = (*pytest_command, "-n", "auto")
+    elif isinstance(pytest_jobs, int) and pytest_jobs > 1:
+        pytest_command = (*pytest_command, "-n", str(pytest_jobs))
+    return (
+        ("ruff", ("-m", "ruff", "check")),
+        ("ty", ("-m", "ty", "check")),
+        ("pytest", pytest_command),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -33,10 +55,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="check.py",
         description="Run the local Ruff, ty, and pytest checks.",
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "-n",
+        "--pytest-jobs",
+        metavar="N",
+        help="Run pytest with xdist using N workers or 'auto' (default: auto).",
+    )
+    args = parser.parse_args(argv)
+    try:
+        pytest_jobs = (
+            None if args.pytest_jobs is None else _parse_pytest_jobs(args.pytest_jobs)
+        )
+    except ValueError as error:
+        parser.error(str(error))
     ensure_project_environment()
 
-    for name, command in CHECKS:
+    for name, command in _build_checks(pytest_jobs=pytest_jobs):
         full_command = (str(VENV_PYTHON), *command)
         print(f"==> {name}: {shlex.join(full_command)}", flush=True)
         completed = subprocess.run(
