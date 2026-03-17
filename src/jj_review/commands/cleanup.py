@@ -277,11 +277,21 @@ async def _inspect_restack(
         )
 
     async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
-        revisions = await _inspect_restack_revisions(
-            github_client=github_client,
-            github_repository=github_repository,
-            prepared_status=prepared_status,
-        )
+        try:
+            revisions = await _inspect_restack_revisions(
+                github_client=github_client,
+                github_repository=github_repository,
+                prepared_status=prepared_status,
+            )
+        except GithubClientError as error:
+            return _RestackInspection(
+                github_error=_summarize_restack_batch_error(error),
+                github_repository=github_repository.full_name,
+                remote=prepared.remote,
+                remote_error=None,
+                revisions=(),
+                selected_revset=selected_revset,
+            )
 
     github_error = next(
         (
@@ -556,9 +566,7 @@ def _restack_lookup_from_head_pull_requests(
             repository_error=None,
             state="ambiguous",
         )
-    return _restack_lookup_from_pull_request(
-        _normalize_restack_pull_request(pull_requests[0])
-    )
+    return _restack_lookup_from_pull_request(_normalize_restack_pull_request(pull_requests[0]))
 
 
 def _restack_lookup_from_error(*, action: str, error: GithubClientError) -> PullRequestLookup:
@@ -606,9 +614,17 @@ def _summarize_restack_repository_error(error: GithubClientError) -> str:
     return f"unavailable (GitHub {error.status_code})"
 
 
+def _summarize_restack_batch_error(error: GithubClientError) -> str:
+    if _is_repository_level_restack_error(error):
+        return _summarize_restack_repository_error(error)
+    return _summarize_restack_lookup_error(action="pull request lookup", error=error)
+
+
 def _is_repository_level_restack_error(error: GithubClientError) -> bool:
-    return error.status_code in {401, 403, 404} or error.status_code is None or (
-        error.status_code is not None and error.status_code >= 500
+    return (
+        error.status_code in {401, 403, 404}
+        or error.status_code is None
+        or (error.status_code is not None and error.status_code >= 500)
     )
 
 
@@ -620,9 +636,7 @@ def _build_restack_result(
 ) -> RestackResult:
     prepared_status = prepared_restack.prepared_status
     prepared = prepared_status.prepared
-    revisions_by_change_id = {
-        revision.change_id: revision for revision in inspection.revisions
-    }
+    revisions_by_change_id = {revision.change_id: revision for revision in inspection.revisions}
     path_revisions = tuple(
         revisions_by_change_id[prepared_revision.revision.change_id]
         for prepared_revision in prepared.status_revisions
@@ -1336,9 +1350,7 @@ def _pull_request_is_closed_or_detached(
     if bookmark is None:
         return False
     expected_label = f"{github_repository.owner}:{bookmark}"
-    return (
-        pull_request.head.ref != bookmark or pull_request.head.label != expected_label
-    )
+    return pull_request.head.ref != bookmark or pull_request.head.label != expected_label
 
 
 async def _resolve_managed_stack_comment(
@@ -1354,11 +1366,7 @@ async def _resolve_managed_stack_comment(
     )
     if cached_change.stack_comment_id is not None:
         cached_comment = next(
-            (
-                comment
-                for comment in comments
-                if comment.id == cached_change.stack_comment_id
-            ),
+            (comment for comment in comments if comment.id == cached_change.stack_comment_id),
             None,
         )
         if cached_comment is not None:
@@ -1374,9 +1382,7 @@ async def _resolve_managed_stack_comment(
                 )
             return cached_comment
 
-    managed_comments = [
-        comment for comment in comments if _STACK_COMMENT_MARKER in comment.body
-    ]
+    managed_comments = [comment for comment in comments if _STACK_COMMENT_MARKER in comment.body]
     if len(managed_comments) > 1:
         return CleanupAction(
             kind="stack comment",
@@ -1405,8 +1411,7 @@ async def _list_issue_comments(
         )
     except GithubClientError as error:
         raise CleanupError(
-            f"Could not list stack comments for pull request #{pull_request_number}: "
-            f"{error}"
+            f"Could not list stack comments for pull request #{pull_request_number}: {error}"
         ) from error
 
 
