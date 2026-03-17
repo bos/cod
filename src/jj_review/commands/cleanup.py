@@ -191,7 +191,7 @@ def prepare_restack(
         prepared_status=prepare_status(
             change_overrides=change_overrides,
             config=config,
-            fetch_remote_state=True,
+            fetch_remote_state=False,
             repo_root=repo_root,
             revset=revset,
         ),

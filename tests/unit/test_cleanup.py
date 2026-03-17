@@ -9,9 +9,11 @@ from jj_review.commands.cleanup import (
     PreparedRestack,
     _should_inspect_stack_comment_cleanup,
     _stream_cleanup_async,
+    prepare_restack,
     stream_restack,
 )
 from jj_review.commands.submit import ResolvedGithubRepository
+from jj_review.config import RepoConfig
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
 
@@ -404,3 +406,32 @@ def test_stream_restack_applies_rebase_for_survivor_above_merged_path_revision(
     assert result.actions[0].kind == "restack"
     assert result.actions[0].message == "rebase survivor onto trunk()"
     assert result.actions[0].status == "applied"
+
+
+def test_prepare_restack_skips_fetch_remote_state(monkeypatch) -> None:
+    prepare_calls: list[dict[str, object]] = []
+
+    def fake_prepare_status(**kwargs):
+        prepare_calls.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("jj_review.commands.cleanup.prepare_status", fake_prepare_status)
+
+    result = prepare_restack(
+        apply=False,
+        change_overrides={},
+        config=RepoConfig(),
+        repo_root=cast(Any, "/repo"),
+        revset="@-",
+    )
+
+    assert result.apply is False
+    assert prepare_calls == [
+        {
+            "change_overrides": {},
+            "config": RepoConfig(),
+            "fetch_remote_state": False,
+            "repo_root": "/repo",
+            "revset": "@-",
+        }
+    ]
