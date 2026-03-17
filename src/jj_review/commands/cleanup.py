@@ -234,6 +234,10 @@ async def _stream_cleanup_async(
                 change_id=change_id,
                 jj_client=jj_client,
             )
+            bookmark_state = prepared_cleanup.bookmark_states.get(
+                cached_change.bookmark or "",
+                BookmarkState(name=cached_change.bookmark or ""),
+            )
             if stale_reason is not None:
                 record_action(
                     _cache_action(
@@ -246,10 +250,7 @@ async def _stream_cleanup_async(
                     next_changes.pop(change_id, None)
 
                 remote_plan = _plan_remote_branch_cleanup(
-                    bookmark_state=prepared_cleanup.bookmark_states.get(
-                        cached_change.bookmark or "",
-                        BookmarkState(name=cached_change.bookmark or ""),
-                    ),
+                    bookmark_state=bookmark_state,
                     cached_change=cached_change,
                     remote=remote,
                 )
@@ -272,6 +273,14 @@ async def _stream_cleanup_async(
                             status="applied",
                         )
                     record_action(remote_action)
+
+            if not _should_inspect_stack_comment_cleanup(
+                bookmark_state=bookmark_state,
+                cached_change=cached_change,
+                remote=remote,
+                stale_reason=stale_reason,
+            ):
+                continue
 
             comment_plan = await _plan_stack_comment_cleanup(
                 cached_change=cached_change,
@@ -444,6 +453,28 @@ def _plan_remote_branch_cleanup(
         ),
         expected_remote_target=remote_state.target,
     )
+
+
+def _should_inspect_stack_comment_cleanup(
+    *,
+    bookmark_state: BookmarkState,
+    cached_change: CachedChange,
+    remote: GitRemote | None,
+    stale_reason: str | None,
+) -> bool:
+    if cached_change.pr_number is None:
+        return False
+    if stale_reason is None:
+        return True
+    if cached_change.stack_comment_id is not None:
+        return True
+    if cached_change.pr_state in {"closed", "merged"}:
+        return True
+    if remote is None:
+        return False
+
+    remote_state = bookmark_state.remote_target(remote.name)
+    return remote_state is None or not remote_state.targets
 
 
 async def _plan_stack_comment_cleanup(

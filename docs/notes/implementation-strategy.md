@@ -687,6 +687,10 @@ Implemented in the first vertical cut:
   stacks, deletes only managed stack comments on closed or detached PRs, and
   deletes stale remote review branches only when the remote branch is
   unambiguous and no local bookmark still owns it
+- stale cache entries now avoid extra GitHub stack-comment inspection unless
+  local sparse state suggests comment cleanup could still produce an action,
+  such as a cached managed comment, a cached closed PR, or a missing remote
+  review branch that suggests the PR may now be detached
 - remote-branch cleanup remains conservative and fail-closed: conflicted
   remote branches and still-present local bookmarks are surfaced as blocked
   cleanup items instead of being deleted automatically
