@@ -10,7 +10,7 @@ from pathlib import Path
 
 from jj_review import __version__
 from jj_review.bootstrap import BootstrapError, bootstrap_context
-from jj_review.commands.review_state import run_status, run_sync
+from jj_review.commands.review_state import prepare_status, run_sync, stream_status
 from jj_review.commands.submit import run_submit
 from jj_review.errors import CliError, CommandNotImplementedError
 
@@ -135,42 +135,56 @@ def _build_common_options_parser() -> ArgumentParser:
 
 def _status_handler(args: Namespace) -> int:
     context = bootstrap_context(args)
-    result = run_status(
+    prepared_status = prepare_status(
         change_overrides=context.config.change,
         config=context.config.repo,
         repo_root=context.repo_root,
         revset=args.revset,
     )
-    print(f"Selected revset: {result.selected_revset}")
-    if result.remote is None:
-        if result.remote_error is None:
+    prepared = prepared_status.prepared
+    print(f"Selected revset: {prepared_status.selected_revset}")
+    if prepared.remote is None:
+        if prepared.remote_error is None:
             print("Selected remote: unavailable")
         else:
-            print(f"Selected remote: unavailable ({result.remote_error})")
+            print(f"Selected remote: unavailable ({prepared.remote_error})")
     else:
-        print(f"Selected remote: {result.remote.name}")
-    if result.github_repository is None:
-        if result.github_error is not None:
-            print(f"GitHub target: unavailable ({result.github_error})")
-    else:
-        if result.github_error is None:
-            print(f"GitHub: {result.github_repository}")
-        else:
-            print(f"GitHub target: {result.github_repository} ({result.github_error})")
-    print(f"Trunk: {result.trunk_subject}")
-    if not result.revisions:
-        print("No reviewable commits between the selected revision and `trunk()`.")
-        return 0
+        print(f"Selected remote: {prepared.remote.name}")
+    print(f"Trunk: {prepared_status.trunk_subject}")
 
-    print("Stack:")
-    for revision in reversed(result.revisions):
+    stack_started = False
+
+    def emit_github_status(github_repository: str | None, github_error: str | None) -> None:
+        nonlocal stack_started
+        if github_repository is None:
+            if github_error is not None:
+                print(f"GitHub target: unavailable ({github_error})")
+        else:
+            if github_error is None:
+                print(f"GitHub: {github_repository}")
+            else:
+                print(f"GitHub target: {github_repository} ({github_error})")
+        if prepared.status_revisions:
+            print("Stack:")
+            stack_started = True
+
+    def emit_revision(revision, github_available: bool) -> None:
         summary = _format_status_summary(
             revision,
-            github_available=(
-                result.github_repository is not None and result.github_error is None
-            ),
+            github_available=github_available,
         )
         print(f"- {revision.subject} [{revision.change_id[:12]}]: {summary}")
+
+    result = stream_status(
+        on_github_status=emit_github_status,
+        on_revision=emit_revision,
+        prepared_status=prepared_status,
+    )
+    if not prepared.status_revisions:
+        print("No reviewable commits between the selected revision and `trunk()`.")
+        return 0
+    if not stack_started:
+        print("Stack:")
     return 1 if result.incomplete else 0
 
 

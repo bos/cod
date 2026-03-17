@@ -76,17 +76,20 @@ def test_main_accepts_global_options_after_subcommand(
 ) -> None:
     monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
     monkeypatch.setattr(
-        "jj_review.cli.run_status",
+        "jj_review.cli.prepare_status",
         lambda **kwargs: SimpleNamespace(
-            github_error=None,
-            github_repository=None,
-            incomplete=False,
-            remote=None,
-            remote_error=None,
-            revisions=(),
+            prepared=SimpleNamespace(
+                remote=None,
+                remote_error=None,
+                status_revisions=(),
+            ),
             selected_revset="@",
             trunk_subject="base",
         ),
+    )
+    monkeypatch.setattr(
+        "jj_review.cli.stream_status",
+        lambda **kwargs: SimpleNamespace(incomplete=False),
     )
 
     exit_code = main(["status", "--debug", "--repository", str(tmp_path)])
@@ -105,7 +108,7 @@ def test_main_reports_keyboard_interrupt_without_traceback(
 ) -> None:
     monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
     monkeypatch.setattr(
-        "jj_review.cli.run_status",
+        "jj_review.cli.prepare_status",
         lambda **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
@@ -114,6 +117,93 @@ def test_main_reports_keyboard_interrupt_without_traceback(
 
     assert exit_code == 130
     assert captured.out == ""
+    assert captured.err.strip() == "Interrupted."
+    assert "Traceback" not in captured.err
+
+
+def test_main_status_prints_local_header_before_streaming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+    monkeypatch.setattr(
+        "jj_review.cli.prepare_status",
+        lambda **kwargs: SimpleNamespace(
+            prepared=SimpleNamespace(
+                remote=SimpleNamespace(name="origin"),
+                remote_error=None,
+                status_revisions=(object(),),
+            ),
+            selected_revset="@",
+            trunk_subject="base",
+        ),
+    )
+
+    def fake_stream_status(**kwargs):
+        streamed = capsys.readouterr()
+        assert "Selected revset: @" in streamed.out
+        assert "Selected remote: origin" in streamed.out
+        assert "Trunk: base" in streamed.out
+        kwargs["on_github_status"]("octo-org/stacked-review", None)
+        kwargs["on_revision"](
+            SimpleNamespace(
+                cached_change=None,
+                change_id="abcdefghijkl",
+                pull_request_lookup=SimpleNamespace(
+                    pull_request=SimpleNamespace(number=1),
+                    state="open",
+                ),
+                subject="feature 1",
+            ),
+            True,
+        )
+        return SimpleNamespace(incomplete=False)
+
+    monkeypatch.setattr(
+        "jj_review.cli.stream_status",
+        fake_stream_status,
+    )
+
+    exit_code = main(["status", "--repository", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "GitHub: octo-org/stacked-review" in captured.out
+    assert "Stack:" in captured.out
+    assert "- feature 1 [abcdefghijkl]: PR #1" in captured.out
+
+
+def test_main_reports_keyboard_interrupt_during_status_stream_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+    monkeypatch.setattr(
+        "jj_review.cli.prepare_status",
+        lambda **kwargs: SimpleNamespace(
+            prepared=SimpleNamespace(
+                remote=None,
+                remote_error=None,
+                status_revisions=(),
+            ),
+            selected_revset="@",
+            trunk_subject="base",
+        ),
+    )
+    monkeypatch.setattr(
+        "jj_review.cli.stream_status",
+        lambda **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    exit_code = main(["status", "--repository", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 130
+    assert "Selected revset: @" in captured.out
+    assert "Selected remote: unavailable" in captured.out
+    assert "Trunk: base" in captured.out
     assert captured.err.strip() == "Interrupted."
     assert "Traceback" not in captured.err
 

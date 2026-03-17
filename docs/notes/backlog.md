@@ -59,16 +59,15 @@ before attempting `jj git push`.
 
 ## Status Command Architecture
 
-The current `status` implementation computes a full `StatusResult` before
-printing anything. That makes it easy to bundle repo-level and per-change
-state, but it also means the command cannot stream output incrementally and may
-be carrying a command-specific result object that does not justify its added
-indirection.
+`status` now prepares local state first, prints the local header immediately,
+and streams per-change rows after bounded concurrent GitHub inspection starts.
+It still keeps a collected `StatusResult` as a secondary API for tests and any
+future non-streaming callers.
 
-We should revisit whether `status` should:
+We should still revisit whether `status` should:
 
-- print incremental progress or per-change output as it inspects GitHub state
-- keep a top-level `StatusResult` object at all, or instead stream status
-  events / render directly from the handler
-- separate repo-level GitHub reachability from per-change review state more
-  cleanly
+- show explicit in-progress markers while GitHub inspection is underway
+- keep a top-level collected `StatusResult` object at all, or switch fully to
+  streamed status events
+- separate repo-level GitHub reachability from per-change review state even
+  more cleanly in the renderer
