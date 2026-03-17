@@ -26,6 +26,7 @@ from jj_review.models.cache import CachedChange, ReviewState
 from jj_review.models.github import GithubIssueComment, GithubPullRequest
 
 CleanupActionStatus = Literal["applied", "blocked", "planned"]
+_GITHUB_INSPECTION_CONCURRENCY = 4
 
 
 class CleanupError(CliError):
@@ -82,6 +83,17 @@ class RemoteBranchCleanupPlan:
 
     action: CleanupAction
     expected_remote_target: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCleanupChange:
+    """Locally prepared cleanup state for one cached change."""
+
+    bookmark_state: BookmarkState
+    cached_change: CachedChange
+    change_id: str
+    inspect_stack_comment: bool
+    stale_reason: str | None
 
 
 def run_cleanup(
@@ -169,10 +181,12 @@ async def _stream_cleanup_async(
 
     if prepared_cleanup.github_repository is None:
         for change_id, cached_change in prepared_cleanup.state.changes.items():
-            stale_reason = _stale_change_reason(
+            prepared_change = _prepare_cleanup_change(
+                cached_change=cached_change,
                 change_id=change_id,
-                jj_client=jj_client,
+                prepared_cleanup=prepared_cleanup,
             )
+            stale_reason = prepared_change.stale_reason
             if stale_reason is None:
                 continue
             record_action(
@@ -186,10 +200,7 @@ async def _stream_cleanup_async(
                 next_changes.pop(change_id, None)
 
             remote_plan = _plan_remote_branch_cleanup(
-                bookmark_state=prepared_cleanup.bookmark_states.get(
-                    cached_change.bookmark or "",
-                    BookmarkState(name=cached_change.bookmark or ""),
-                ),
+                bookmark_state=prepared_change.bookmark_state,
                 cached_change=cached_change,
                 remote=remote,
             )
@@ -229,87 +240,95 @@ async def _stream_cleanup_async(
 
     github_repository = prepared_cleanup.github_repository
     async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
+        prepared_changes: list[PreparedCleanupChange] = []
         for change_id, cached_change in prepared_cleanup.state.changes.items():
-            stale_reason = _stale_change_reason(
+            prepared_change = _prepare_cleanup_change(
+                cached_change=cached_change,
                 change_id=change_id,
-                jj_client=jj_client,
+                prepared_cleanup=prepared_cleanup,
             )
-            bookmark_state = prepared_cleanup.bookmark_states.get(
-                cached_change.bookmark or "",
-                BookmarkState(name=cached_change.bookmark or ""),
+            prepared_changes.append(prepared_change)
+
+            stale_reason = prepared_change.stale_reason
+            if stale_reason is None:
+                continue
+
+            record_action(
+                _cache_action(
+                    change_id=change_id,
+                    reason=stale_reason,
+                    status="applied" if apply else "planned",
+                )
             )
-            if stale_reason is not None:
-                record_action(
-                    _cache_action(
-                        change_id=change_id,
-                        reason=stale_reason,
-                        status="applied" if apply else "planned",
-                    )
-                )
-                if apply:
-                    next_changes.pop(change_id, None)
+            if apply:
+                next_changes.pop(change_id, None)
 
-                remote_plan = _plan_remote_branch_cleanup(
-                    bookmark_state=bookmark_state,
-                    cached_change=cached_change,
-                    remote=remote,
-                )
-                if remote_plan is not None:
-                    remote_action = remote_plan.action
-                    if (
-                        apply
-                        and remote_action.status == "planned"
-                        and remote is not None
-                        and remote_plan.expected_remote_target is not None
-                    ):
-                        jj_client.delete_remote_bookmark(
-                            remote=remote.name,
-                            bookmark=cached_change.bookmark or "",
-                            expected_remote_target=remote_plan.expected_remote_target,
-                        )
-                        remote_action = CleanupAction(
-                            kind=remote_plan.action.kind,
-                            message=remote_plan.action.message,
-                            status="applied",
-                        )
-                    record_action(remote_action)
-
-            if not _should_inspect_stack_comment_cleanup(
-                bookmark_state=bookmark_state,
+            remote_plan = _plan_remote_branch_cleanup(
+                bookmark_state=prepared_change.bookmark_state,
                 cached_change=cached_change,
                 remote=remote,
-                stale_reason=stale_reason,
-            ):
-                continue
-
-            comment_plan = await _plan_stack_comment_cleanup(
-                cached_change=cached_change,
-                github_client=github_client,
-                github_repository=github_repository,
             )
-            if comment_plan is None:
-                continue
-            comment_action = comment_plan.action
-            if (
-                apply
-                and comment_action.status == "planned"
-                and comment_plan.comment_id is not None
-            ):
-                await _delete_issue_comment(
-                    comment_id=comment_plan.comment_id,
-                    github_client=github_client,
-                    github_repository=github_repository,
-                )
-                if change_id in next_changes:
-                    next_changes[change_id] = next_changes[change_id].model_copy(
-                        update={"stack_comment_id": None}
+            if remote_plan is not None:
+                remote_action = remote_plan.action
+                if (
+                    apply
+                    and remote_action.status == "planned"
+                    and remote is not None
+                    and remote_plan.expected_remote_target is not None
+                ):
+                    jj_client.delete_remote_bookmark(
+                        remote=remote.name,
+                        bookmark=cached_change.bookmark or "",
+                        expected_remote_target=remote_plan.expected_remote_target,
                     )
-                comment_action = CleanupAction(
-                    kind=comment_plan.action.kind,
-                    message=comment_plan.action.message,
-                    status="applied",
-                )
-            record_action(comment_action)
+                    remote_action = CleanupAction(
+                        kind=remote_plan.action.kind,
+                        message=remote_plan.action.message,
+                        status="applied",
+                    )
+                record_action(remote_action)
+
+        comment_plan_tasks = _create_stack_comment_cleanup_tasks(
+            github_client=github_client,
+            github_repository=github_repository,
+            prepared_changes=tuple(prepared_changes),
+        )
+        try:
+            for prepared_change in prepared_changes:
+                change_id = prepared_change.change_id
+                if not prepared_change.inspect_stack_comment:
+                    continue
+
+                comment_plan = await comment_plan_tasks[change_id]
+                if comment_plan is None:
+                    continue
+                comment_action = comment_plan.action
+                if (
+                    apply
+                    and comment_action.status == "planned"
+                    and comment_plan.comment_id is not None
+                ):
+                    await _delete_issue_comment(
+                        comment_id=comment_plan.comment_id,
+                        github_client=github_client,
+                        github_repository=github_repository,
+                    )
+                    if change_id in next_changes:
+                        next_changes[change_id] = next_changes[change_id].model_copy(
+                            update={"stack_comment_id": None}
+                        )
+                    comment_action = CleanupAction(
+                        kind=comment_plan.action.kind,
+                        message=comment_plan.action.message,
+                        status="applied",
+                    )
+                record_action(comment_action)
+        finally:
+            for task in comment_plan_tasks.values():
+                if not task.done():
+                    task.cancel()
+            if comment_plan_tasks:
+                await asyncio.gather(*comment_plan_tasks.values(), return_exceptions=True)
 
     if apply and next_changes != prepared_cleanup.state.changes:
         prepared_cleanup.state_store.save(
@@ -324,6 +343,70 @@ async def _stream_cleanup_async(
         remote=remote,
         remote_error=prepared_cleanup.remote_error,
     )
+
+
+def _prepare_cleanup_change(
+    *,
+    cached_change: CachedChange,
+    change_id: str,
+    prepared_cleanup: PreparedCleanup,
+) -> PreparedCleanupChange:
+    bookmark_state = prepared_cleanup.bookmark_states.get(
+        cached_change.bookmark or "",
+        BookmarkState(name=cached_change.bookmark or ""),
+    )
+    stale_reason = _stale_change_reason(
+        change_id=change_id,
+        jj_client=prepared_cleanup.jj_client,
+    )
+    return PreparedCleanupChange(
+        bookmark_state=bookmark_state,
+        cached_change=cached_change,
+        change_id=change_id,
+        inspect_stack_comment=_should_inspect_stack_comment_cleanup(
+            bookmark_state=bookmark_state,
+            cached_change=cached_change,
+            remote=prepared_cleanup.remote,
+            stale_reason=stale_reason,
+        ),
+        stale_reason=stale_reason,
+    )
+
+
+def _create_stack_comment_cleanup_tasks(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    prepared_changes: tuple[PreparedCleanupChange, ...],
+) -> dict[str, asyncio.Task[StackCommentCleanupPlan | None]]:
+    semaphore = asyncio.Semaphore(_GITHUB_INSPECTION_CONCURRENCY)
+    return {
+        prepared_change.change_id: asyncio.create_task(
+            _plan_stack_comment_cleanup_with_semaphore(
+                cached_change=prepared_change.cached_change,
+                github_client=github_client,
+                github_repository=github_repository,
+                semaphore=semaphore,
+            )
+        )
+        for prepared_change in prepared_changes
+        if prepared_change.inspect_stack_comment
+    }
+
+
+async def _plan_stack_comment_cleanup_with_semaphore(
+    *,
+    cached_change: CachedChange,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    semaphore: asyncio.Semaphore,
+) -> StackCommentCleanupPlan | None:
+    async with semaphore:
+        return await _plan_stack_comment_cleanup(
+            cached_change=cached_change,
+            github_client=github_client,
+            github_repository=github_repository,
+        )
 
 
 def _resolve_remote(

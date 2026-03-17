@@ -691,6 +691,9 @@ Implemented in the first vertical cut:
   local sparse state suggests comment cleanup could still produce an action,
   such as a cached managed comment, a cached closed PR, or a missing remote
   review branch that suggests the PR may now be detached
+- cleanup now overlaps the remaining GitHub stack-comment inspection with
+  bounded concurrency while still applying any resulting mutations in the
+  original cache-entry order
 - remote-branch cleanup remains conservative and fail-closed: conflicted
   remote branches and still-present local bookmarks are surfaced as blocked
   cleanup items instead of being deleted automatically
