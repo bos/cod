@@ -129,3 +129,41 @@ def test_github_client_does_not_retry_non_rate_limited_errors() -> None:
 
     assert attempts == 1
     assert sleeps == []
+
+
+def test_github_client_lists_pull_request_reviews() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octo-org/stacked-review/pulls/7/reviews"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "state": "APPROVED",
+                    "user": {"login": "reviewer-1"},
+                },
+                {
+                    "id": 2,
+                    "state": "COMMENTED",
+                    "user": {"login": "reviewer-2"},
+                },
+            ],
+            request=request,
+        )
+
+    async def run_test() -> tuple[str, str]:
+        transport = httpx.MockTransport(handler)
+        async with GithubClient(
+            base_url="https://api.github.test",
+            transport=transport,
+        ) as client:
+            reviews = await client.list_pull_request_reviews(
+                "octo-org",
+                "stacked-review",
+                pull_number=7,
+            )
+        if reviews[0].user is None:
+            raise AssertionError("Review payload should include a user.")
+        return reviews[0].user.login, reviews[1].state
+
+    assert asyncio.run(run_test()) == ("reviewer-1", "COMMENTED")

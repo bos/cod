@@ -18,6 +18,7 @@ def test_review_state_store_round_trips_and_creates_parent_directories(tmp_path:
             change={
                 "zvlywqkxtmnpqrstu": CachedChange(
                     bookmark="review/fix-cache-invalidation-zvlywqkx",
+                    pr_review_decision="approved",
                     pr_state="open",
                 )
             }
@@ -29,6 +30,7 @@ def test_review_state_store_round_trips_and_creates_parent_directories(tmp_path:
     assert loaded_state.changes["zvlywqkxtmnpqrstu"].bookmark == (
         "review/fix-cache-invalidation-zvlywqkx"
     )
+    assert loaded_state.changes["zvlywqkxtmnpqrstu"].pr_review_decision == "approved"
     assert loaded_state.changes["zvlywqkxtmnpqrstu"].pr_state == "open"
     assert state_path.exists()
 

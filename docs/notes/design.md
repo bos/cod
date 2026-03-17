@@ -362,6 +362,9 @@ Unlike `submit` or `sync`, it may fall back to local-only reporting when the
 repo is not configured well enough to resolve a remote or GitHub target.
 Its default output should stay concise and summarize the effective review state
 for each change rather than dumping cache and transport diagnostics inline.
+When GitHub data is available, that summary should distinguish merged pull
+requests from merely closed ones, and may surface a concise review-decision
+summary such as approval or changes requested for still-open pull requests.
 If GitHub is unreachable or misconfigured, status should report that once at the
 repo level and then fall back to conservative per-change summaries derived from
 local cache rather than claiming a PR is absent. Because that output is

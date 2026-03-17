@@ -53,6 +53,19 @@ async def _round_trip_issue_comment(app: FastAPI) -> tuple[str, str]:
     return listed[0].body, updated.body
 
 
+async def _round_trip_pull_request_reviews(app: FastAPI) -> tuple[str, str]:
+    transport = httpx.ASGITransport(app=app)
+    async with GithubClient(base_url="https://api.github.test", transport=transport) as client:
+        reviews = await client.list_pull_request_reviews(
+            "octo-org",
+            "stacked-review",
+            pull_number=1,
+        )
+    if reviews[0].user is None:
+        raise AssertionError("Review payload should include a user.")
+    return reviews[0].user.login, reviews[1].state
+
+
 def test_fake_github_repository_endpoint_round_trips_through_client(tmp_path: Path) -> None:
     fake_repo = initialize_bare_repository(
         tmp_path,
@@ -128,3 +141,33 @@ def test_fake_github_issue_comments_round_trip_through_client(tmp_path: Path) ->
 
     assert listed_body == "first body"
     assert updated_body == "updated body"
+
+
+def test_fake_github_pull_request_reviews_round_trip_through_client(tmp_path: Path) -> None:
+    fake_repo = initialize_bare_repository(
+        tmp_path,
+        owner="octo-org",
+        name="stacked-review",
+    )
+    fake_repo.create_pull_request(
+        base_ref="main",
+        body="body",
+        head_ref="feature",
+        title="feature",
+    )
+    fake_repo.create_pull_request_review(
+        pull_number=1,
+        reviewer_login="reviewer-1",
+        state="APPROVED",
+    )
+    fake_repo.create_pull_request_review(
+        pull_number=1,
+        reviewer_login="reviewer-2",
+        state="COMMENTED",
+    )
+    app = create_app(FakeGithubState.single_repository(fake_repo))
+
+    first_reviewer, second_state = asyncio.run(_round_trip_pull_request_reviews(app))
+
+    assert first_reviewer == "reviewer-1"
+    assert second_state == "COMMENTED"

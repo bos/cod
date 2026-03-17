@@ -49,6 +49,7 @@ class PullRequestLookup:
     message: str | None
     pull_request: GithubPullRequest | None
     state: PullRequestLookupState
+    review_decision: str | None = None
     repository_error: str | None = None
 
 
@@ -401,6 +402,7 @@ async def _run_sync_async(
                 update={
                     "bookmark": revision.bookmark,
                     "pr_number": pull_request.number,
+                    "pr_review_decision": pull_request_lookup.review_decision,
                     "pr_state": pull_request.state,
                     "pr_url": pull_request.html_url,
                 }
@@ -569,6 +571,7 @@ def _persist_status_cache_updates(
                     update={
                         "bookmark": revision.bookmark,
                         "pr_number": None,
+                        "pr_review_decision": None,
                         "pr_state": None,
                         "pr_url": None,
                         "stack_comment_id": None,
@@ -580,6 +583,7 @@ def _persist_status_cache_updates(
                     update={
                         "bookmark": revision.bookmark,
                         "pr_number": pull_request.number,
+                        "pr_review_decision": pull_request_lookup.review_decision,
                         "pr_state": pull_request.state,
                         "pr_url": pull_request.html_url,
                     }
@@ -824,22 +828,68 @@ async def _inspect_pull_request(
         )
 
     pull_request = pull_requests[0]
-    if pull_request.state != "open":
+    effective_pull_request = _normalize_pull_request_state(pull_request)
+    if effective_pull_request.state != "open":
         return PullRequestLookup(
             message=(
-                f"GitHub reports pull request #{pull_request.number} for head branch "
-                f"{head_label!r} in state {pull_request.state!r}."
+                f"GitHub reports pull request #{effective_pull_request.number} for head branch "
+                f"{head_label!r} in state {effective_pull_request.state!r}."
             ),
-            pull_request=pull_request,
+            pull_request=effective_pull_request,
+            review_decision=None,
             repository_error=None,
             state="closed",
         )
+    review_decision = await _inspect_pull_request_review_decision(
+        github_client=github_client,
+        github_repository=github_repository,
+        pull_request_number=effective_pull_request.number,
+    )
     return PullRequestLookup(
         message=None,
-        pull_request=pull_request,
+        pull_request=effective_pull_request,
+        review_decision=review_decision,
         repository_error=None,
         state="open",
     )
+
+
+def _normalize_pull_request_state(pull_request: GithubPullRequest) -> GithubPullRequest:
+    if pull_request.state != "closed" or pull_request.merged_at is None:
+        return pull_request
+    return pull_request.model_copy(update={"state": "merged"})
+
+
+async def _inspect_pull_request_review_decision(
+    *,
+    github_client: GithubClient,
+    github_repository,
+    pull_request_number: int,
+) -> str | None:
+    try:
+        reviews = await github_client.list_pull_request_reviews(
+            github_repository.owner,
+            github_repository.repo,
+            pull_number=pull_request_number,
+        )
+    except GithubClientError:
+        return None
+
+    latest_relevant_reviews_by_user: dict[str, str] = {}
+    for review in reviews:
+        if review.user is None:
+            continue
+        normalized_state = review.state.upper()
+        if normalized_state not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            continue
+        latest_relevant_reviews_by_user[review.user.login] = normalized_state
+
+    review_states = set(latest_relevant_reviews_by_user.values())
+    if "CHANGES_REQUESTED" in review_states:
+        return "changes_requested"
+    if "APPROVED" in review_states:
+        return "approved"
+    return None
 
 
 async def _inspect_stack_comment(

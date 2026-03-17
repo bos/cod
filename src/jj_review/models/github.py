@@ -35,9 +35,28 @@ class GithubPullRequest(BaseModel):
     body: str | None = None
     head: GithubBranchRef
     html_url: str
+    merged_at: str | None = None
     number: int
     state: str
     title: str
+
+
+class GithubPullRequestReviewUser(BaseModel):
+    """Subset of review-author fields used to summarize PR reviews."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    login: str
+
+
+class GithubPullRequestReview(BaseModel):
+    """Subset of PR review fields used by the client."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    state: str
+    user: GithubPullRequestReviewUser | None = None
 
 
 class GithubIssueComment(BaseModel):

@@ -1039,14 +1039,74 @@ def test_status_refreshes_closed_pull_request_state_in_cache(
     refreshed_state = state_store.load()
 
     assert exit_code == 0
-    assert ": PR #1 is closed" in captured.out
+    assert ": PR #1 closed" in captured.out
     assert refreshed_state.changes[change_id].pr_number == 1
+    assert refreshed_state.changes[change_id].pr_review_decision is None
     assert refreshed_state.changes[change_id].pr_state == "closed"
     assert (
         refreshed_state.changes[change_id].pr_url
         == "https://github.test/octo-org/stacked-review/pull/1"
     )
     assert refreshed_state.changes[change_id].stack_comment_id is None
+
+
+def test_status_reports_approved_pull_request_state(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    change_id = stack.revisions[-1].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    fake_repo.create_pull_request_review(
+        pull_number=1,
+        reviewer_login="reviewer-1",
+        state="APPROVED",
+    )
+
+    exit_code = _main(repo, config_path, "status", change_id)
+    captured = capsys.readouterr()
+    refreshed_state = state_store.load()
+
+    assert exit_code == 0
+    assert ": PR #1 approved" in captured.out
+    assert refreshed_state.changes[change_id].pr_review_decision == "approved"
+    assert refreshed_state.changes[change_id].pr_state == "open"
+
+
+def test_status_reports_merged_pull_request_state(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    change_id = stack.revisions[-1].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    fake_repo.pull_requests[1].state = "closed"
+    fake_repo.pull_requests[1].merged_at = "2026-03-16T12:00:00Z"
+
+    exit_code = _main(repo, config_path, "status", change_id)
+    captured = capsys.readouterr()
+    refreshed_state = state_store.load()
+
+    assert exit_code == 0
+    assert ": PR #1 merged" in captured.out
+    assert refreshed_state.changes[change_id].pr_state == "merged"
+    assert refreshed_state.changes[change_id].pr_review_decision is None
 
 
 def test_sync_refreshes_cached_pull_request_metadata_after_state_loss(

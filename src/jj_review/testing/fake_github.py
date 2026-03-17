@@ -18,6 +18,7 @@ class FakeGithubPullRequest:
     body: str
     head_label: str
     head_ref: str
+    merged_at: str | None
     number: int
     title: str
     state: str = "open"
@@ -33,9 +34,27 @@ class FakeGithubPullRequest:
             "body": self.body,
             "head": {"label": self.head_label, "ref": self.head_ref},
             "html_url": f"{web_origin}/{repository.full_name}/pull/{self.number}",
+            "merged_at": self.merged_at,
             "number": self.number,
             "state": self.state,
             "title": self.title,
+        }
+
+
+@dataclass(slots=True)
+class FakeGithubPullRequestReview:
+    """Mutable pull request review state served by the fake API."""
+
+    id: int
+    pull_request_number: int
+    reviewer_login: str
+    state: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "state": self.state,
+            "user": {"login": self.reviewer_login},
         }
 
 
@@ -73,8 +92,12 @@ class FakeGithubRepository:
     owner: str
     next_issue_comment_id: int = 1
     next_pull_request_number: int = 1
+    next_pull_request_review_id: int = 1
     issue_comments: dict[int, list[FakeGithubIssueComment]] = field(default_factory=dict)
     pull_requests: dict[int, FakeGithubPullRequest] = field(default_factory=dict)
+    pull_request_reviews: dict[int, list[FakeGithubPullRequestReview]] = field(
+        default_factory=dict
+    )
 
     @property
     def full_name(self) -> str:
@@ -106,11 +129,34 @@ class FakeGithubRepository:
             body=body,
             head_label=f"{self.owner}:{head_ref}",
             head_ref=head_ref,
+            merged_at=None,
             number=number,
             title=title,
         )
         self.pull_requests[number] = pull_request
         return pull_request
+
+    def list_pull_request_reviews(self, pull_number: int) -> list[FakeGithubPullRequestReview]:
+        self._require_issue_number(pull_number)
+        return list(self.pull_request_reviews.get(pull_number, ()))
+
+    def create_pull_request_review(
+        self,
+        *,
+        pull_number: int,
+        reviewer_login: str,
+        state: str,
+    ) -> FakeGithubPullRequestReview:
+        self._require_issue_number(pull_number)
+        review = FakeGithubPullRequestReview(
+            id=self.next_pull_request_review_id,
+            pull_request_number=pull_number,
+            reviewer_login=reviewer_login,
+            state=state,
+        )
+        self.next_pull_request_review_id += 1
+        self.pull_request_reviews.setdefault(pull_number, []).append(review)
+        return review
 
     def list_issue_comments(self, issue_number: int) -> list[FakeGithubIssueComment]:
         self._require_issue_number(issue_number)
@@ -243,6 +289,19 @@ def create_app(fake_state: FakeGithubState) -> FastAPI:
             pull_request.base_ref = _require_string(payload, "base")
             _require_branch(repository, pull_request.base_ref)
         return pull_request.to_payload(repository=repository, web_origin=fake_state.web_origin)
+
+    @app.get("/repos/{owner}/{repo}/pulls/{pull_number}/reviews")
+    async def list_pull_request_reviews(
+        owner: str,
+        repo: str,
+        pull_number: int,
+    ) -> list[dict[str, object]]:
+        repository = _get_repository(fake_state, owner, repo)
+        reviews = repository.list_pull_request_reviews(pull_number)
+        return [
+            review.to_payload()
+            for review in sorted(reviews, key=lambda candidate: candidate.id)
+        ]
 
     @app.get("/repos/{owner}/{repo}/issues/{issue_number}/comments")
     async def list_issue_comments(

@@ -324,7 +324,13 @@ def _format_status_summary(revision, *, github_available: bool) -> str:
     if lookup.state == "open":
         if lookup.pull_request is None:
             raise AssertionError("Open pull request lookup must include a pull request.")
-        return f"PR #{lookup.pull_request.number}"
+        summary = f"PR #{lookup.pull_request.number}"
+        review_decision = getattr(lookup, "review_decision", None)
+        if review_decision == "approved":
+            return f"{summary} approved"
+        if review_decision == "changes_requested":
+            return f"{summary} changes requested"
+        return summary
     if lookup.state == "missing":
         if cached_label is not None:
             return f"{cached_label}, no GitHub PR"
@@ -332,7 +338,9 @@ def _format_status_summary(revision, *, github_available: bool) -> str:
     if lookup.state == "closed":
         if lookup.pull_request is None:
             raise AssertionError("Closed pull request lookup must include a pull request.")
-        return f"PR #{lookup.pull_request.number} is {lookup.pull_request.state}"
+        if lookup.pull_request.state == "merged":
+            return f"PR #{lookup.pull_request.number} merged"
+        return f"PR #{lookup.pull_request.number} closed"
     message = lookup.message or "GitHub lookup failed"
     if cached_label is not None:
         return f"{cached_label}, {message}"
@@ -351,7 +359,11 @@ def _format_pull_request_status(revision) -> str:
     if lookup.state == "open":
         if lookup.pull_request is None:
             raise AssertionError("Open pull request lookup must include a pull request.")
-        return f"{cached_label}, GitHub PR #{lookup.pull_request.number}"
+        summary = f"{cached_label}, GitHub PR #{lookup.pull_request.number}"
+        review_decision = getattr(lookup, "review_decision", None)
+        if review_decision is None:
+            return summary
+        return f"{summary} {_format_review_decision_label(review_decision)}"
     if lookup.state == "missing":
         return f"{cached_label}, no GitHub PR"
     message = lookup.message or "pull request lookup failed"
@@ -365,7 +377,20 @@ def _format_cached_pull_request_label(cached_change) -> str | None:
     label = f"cached PR #{cached_change.pr_number}"
     if cached_change.pr_state is None:
         return label
-    return f"{label} ({cached_change.pr_state})"
+
+    details = [cached_change.pr_state]
+    if (
+        cached_change.pr_state == "open"
+        and cached_change.pr_review_decision is not None
+    ):
+        details.append(_format_review_decision_label(cached_change.pr_review_decision))
+    return f"{label} ({', '.join(details)})"
+
+
+def _format_review_decision_label(review_decision: str) -> str:
+    if review_decision == "changes_requested":
+        return "changes requested"
+    return review_decision
 
 
 def _format_stack_comment_status(revision) -> str:

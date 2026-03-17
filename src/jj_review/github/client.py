@@ -11,7 +11,12 @@ from typing import Any
 
 import httpx
 
-from jj_review.models.github import GithubIssueComment, GithubPullRequest, GithubRepository
+from jj_review.models.github import (
+    GithubIssueComment,
+    GithubPullRequest,
+    GithubPullRequestReview,
+    GithubRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +119,24 @@ class GithubClient:
             json={"base": base, "body": body, "head": head, "title": title},
         )
         return GithubPullRequest.model_validate(self._expect_success(response))
+
+    async def list_pull_request_reviews(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        pull_number: int,
+    ) -> tuple[GithubPullRequestReview, ...]:
+        response = await self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+        )
+        payload = self._expect_success(response)
+        if not isinstance(payload, list):
+            raise GithubClientError(
+                "GitHub pull request reviews response was not a JSON array."
+            )
+        return tuple(GithubPullRequestReview.model_validate(item) for item in payload)
 
     async def list_issue_comments(
         self,
