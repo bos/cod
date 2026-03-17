@@ -1504,6 +1504,48 @@ def test_cleanup_apply_deletes_managed_stack_comment_for_closed_pull_request(
     assert _issue_comments(fake_repo, 1) == []
 
 
+def test_cleanup_apply_deletes_discovered_stack_comment_when_cache_id_is_missing(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    change_id = stack.revisions[-1].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    initial_state = state_store.load()
+    fake_repo.pull_requests[1].state = "closed"
+    state_store.save(
+        initial_state.model_copy(
+            update={
+                "changes": {
+                    **initial_state.changes,
+                    change_id: initial_state.changes[change_id].model_copy(
+                        update={"stack_comment_id": None}
+                    ),
+                }
+            }
+        )
+    )
+
+    exit_code = _main(repo, config_path, "cleanup", "--apply")
+    captured = capsys.readouterr()
+    refreshed_state = state_store.load()
+
+    assert exit_code == 0
+    assert "[applied] stack comment: delete managed stack comment #1 from PR #1" in (
+        captured.out
+    )
+    assert refreshed_state.changes[change_id].stack_comment_id is None
+    assert _issue_comments(fake_repo, 1) == []
+
+
 def _configure_submit_environment(
     monkeypatch,
     tmp_path: Path,

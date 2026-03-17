@@ -51,6 +51,14 @@ class CleanupResult:
     remote_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class StackCommentCleanupPlan:
+    """Planned or blocked stack-comment cleanup details."""
+
+    action: CleanupAction
+    comment_id: int | None = None
+
+
 def run_cleanup(
     *,
     apply: bool,
@@ -184,21 +192,21 @@ async def _run_cleanup_async(
                             status="applied",
                         )
 
-            comment_action = await _plan_stack_comment_cleanup(
+            comment_plan = await _plan_stack_comment_cleanup(
                 cached_change=cached_change,
                 github_client=github_client,
                 github_repository=github_repository,
             )
-            if comment_action is None:
+            if comment_plan is None:
                 continue
-            actions.append(comment_action)
+            actions.append(comment_plan.action)
             if (
                 apply
-                and comment_action.status == "planned"
-                and cached_change.stack_comment_id is not None
+                and comment_plan.action.status == "planned"
+                and comment_plan.comment_id is not None
             ):
                 await _delete_issue_comment(
-                    comment_id=cached_change.stack_comment_id,
+                    comment_id=comment_plan.comment_id,
                     github_client=github_client,
                     github_repository=github_repository,
                 )
@@ -207,8 +215,8 @@ async def _run_cleanup_async(
                         update={"stack_comment_id": None}
                     )
                 actions[-1] = CleanupAction(
-                    kind=comment_action.kind,
-                    message=comment_action.message,
+                    kind=comment_plan.action.kind,
+                    message=comment_plan.action.message,
                     status="applied",
                 )
 
@@ -352,7 +360,7 @@ async def _plan_stack_comment_cleanup(
     cached_change: CachedChange,
     github_client: GithubClient,
     github_repository,
-) -> CleanupAction | None:
+) -> StackCommentCleanupPlan | None:
     if cached_change.pr_number is None:
         return None
 
@@ -377,17 +385,20 @@ async def _plan_stack_comment_cleanup(
         github_repository=github_repository,
     )
     if isinstance(managed_comment, CleanupAction):
-        return managed_comment
+        return StackCommentCleanupPlan(action=managed_comment)
     if managed_comment is None:
         return None
 
-    return CleanupAction(
-        kind="stack comment",
-        message=(
-            "delete managed stack comment "
-            f"#{managed_comment.id} from PR #{cached_change.pr_number}"
+    return StackCommentCleanupPlan(
+        action=CleanupAction(
+            kind="stack comment",
+            message=(
+                "delete managed stack comment "
+                f"#{managed_comment.id} from PR #{cached_change.pr_number}"
+            ),
+            status="planned",
         ),
-        status="planned",
+        comment_id=managed_comment.id,
     )
 
 
