@@ -648,6 +648,8 @@ Implemented in the first vertical cut:
   repository, verifies that the PR is open on a same-repository head branch,
   pins that branch locally for the selected change, and persists the PR
   linkage so a later submit can update the adopted review intentionally
+- `adopt` now also fails closed on GitHub lookup errors instead of surfacing
+  uncaught transport exceptions through the CLI
 
 Deliver:
 

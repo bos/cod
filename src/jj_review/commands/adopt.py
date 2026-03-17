@@ -17,6 +17,7 @@ from jj_review.commands.submit import (
 )
 from jj_review.config import RepoConfig
 from jj_review.errors import CliError
+from jj_review.github.client import GithubClientError
 from jj_review.jj import JjClient
 from jj_review.models.cache import CachedChange, ReviewState
 
@@ -87,11 +88,16 @@ async def _run_adopt_async(
     )
 
     async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
-        pull_request = await github_client.get_pull_request(
-            github_repository.owner,
-            github_repository.repo,
-            pull_number=pull_request_number,
-        )
+        try:
+            pull_request = await github_client.get_pull_request(
+                github_repository.owner,
+                github_repository.repo,
+                pull_number=pull_request_number,
+            )
+        except GithubClientError as error:
+            raise AdoptResolutionError(
+                f"Could not load pull request #{pull_request_number}: {error}"
+            ) from error
 
     if pull_request.state != "open":
         raise AdoptResolutionError(

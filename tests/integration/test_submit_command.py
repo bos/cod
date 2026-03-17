@@ -718,6 +718,23 @@ def test_adopt_repairs_existing_pull_request_linkage_for_rewritten_change(
     )
 
 
+def test_adopt_reports_missing_pull_request_without_traceback(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    exit_code = _main(repo, config_path, "adopt", "999")
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Could not load pull request #999" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_status_refreshes_cached_stack_comment_metadata_after_state_loss(
     tmp_path: Path,
     monkeypatch,
