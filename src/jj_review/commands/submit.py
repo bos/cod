@@ -932,7 +932,6 @@ def _updated_cached_change(
         return CachedChange(
             bookmark=bookmark,
             pr_number=pull_request.number,
-            pr_review_decision=None,
             pr_state=pull_request.state,
             pr_url=pull_request.html_url,
         )
@@ -940,7 +939,6 @@ def _updated_cached_change(
         update={
             "bookmark": bookmark,
             "pr_number": pull_request.number,
-            "pr_review_decision": None,
             "pr_state": pull_request.state,
             "pr_url": pull_request.html_url,
         }
