@@ -399,10 +399,8 @@ async def _run_sync_async(
             continue
         updated_change = cached_change or CachedChange(bookmark=revision.bookmark)
         pull_request_lookup = revision.pull_request_lookup
-        if pull_request_lookup is not None and pull_request_lookup.state == "open":
+        if pull_request_lookup is not None and pull_request_lookup.pull_request is not None:
             pull_request = pull_request_lookup.pull_request
-            if pull_request is None:
-                raise AssertionError("Open pull request lookup must include a pull request.")
             updated_change = updated_change.model_copy(
                 update={
                     "bookmark": revision.bookmark,
@@ -415,14 +413,17 @@ async def _run_sync_async(
                     "pr_url": pull_request.html_url,
                 }
             )
-            stack_comment_lookup = revision.stack_comment_lookup
-            if stack_comment_lookup is not None and stack_comment_lookup.state == "present":
-                if stack_comment_lookup.comment is None:
-                    raise AssertionError("Present stack comment lookup must include a comment.")
-                updated_change = updated_change.model_copy(
-                    update={"stack_comment_id": stack_comment_lookup.comment.id}
-                )
-            elif stack_comment_lookup is not None and stack_comment_lookup.state == "missing":
+            if pull_request_lookup.state == "open":
+                stack_comment_lookup = revision.stack_comment_lookup
+                if stack_comment_lookup is not None and stack_comment_lookup.state == "present":
+                    if stack_comment_lookup.comment is None:
+                        raise AssertionError("Present stack comment lookup must include a comment.")
+                    updated_change = updated_change.model_copy(
+                        update={"stack_comment_id": stack_comment_lookup.comment.id}
+                    )
+                elif stack_comment_lookup is not None and stack_comment_lookup.state == "missing":
+                    updated_change = updated_change.model_copy(update={"stack_comment_id": None})
+            else:
                 updated_change = updated_change.model_copy(update={"stack_comment_id": None})
         state_changes[revision.change_id] = updated_change
 
@@ -967,6 +968,16 @@ def _ensure_syncable_pull_request(
         pull_request = pull_request_lookup.pull_request
         if pull_request is None:
             raise AssertionError("Open pull request lookup must include a pull request.")
+        _ensure_pull_request_linkage_is_consistent(
+            bookmark=bookmark,
+            cached_change=cached_change,
+            discovered_pull_request=pull_request,
+        )
+        return
+    if pull_request_lookup.state == "closed":
+        pull_request = pull_request_lookup.pull_request
+        if pull_request is None:
+            raise AssertionError("Closed pull request lookup must include a pull request.")
         _ensure_pull_request_linkage_is_consistent(
             bookmark=bookmark,
             cached_change=cached_change,
