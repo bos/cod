@@ -1,0 +1,24 @@
+name: block-review-base-merges
+
+on:
+  pull_request_target:
+    branches:
+      - "review/**"
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+
+jobs:
+  reject-review-base-merge:
+    name: reject-review-base-merge
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain policy and fail
+        run: |
+          echo "PRs targeting review/* are review-only and must not be merged."
+          echo "Retarget this PR to main or another allowed base branch."
+          exit 1
