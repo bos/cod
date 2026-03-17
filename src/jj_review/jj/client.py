@@ -79,13 +79,29 @@ class JjClient:
                 trunk=trunk,
             )
 
+        self._validate_reviewable_revision(head)
+        ancestor_revisions = self._query_revisions(f"::{_quote_revset_symbol(head.commit_id)}")
+        revisions_by_commit_id = {
+            revision.commit_id: revision for revision in ancestor_revisions
+        }
+        revisions_by_commit_id[head.commit_id] = head
+        revisions_by_commit_id[trunk.commit_id] = trunk
+        children_by_parent = self._query_children_by_parent(
+            f"children(::{_quote_revset_symbol(head.commit_id)})"
+        )
+
         stack_head_first: list[LocalRevision] = []
         child_in_path: LocalRevision | None = None
         current = head
         while current.commit_id != trunk.commit_id:
-            self._validate_reviewable_revision(current)
+            if current.commit_id != head.commit_id:
+                self._validate_reviewable_revision(current)
             if child_in_path is not None:
-                reviewable_children = self.list_reviewable_children(current.commit_id)
+                reviewable_children = [
+                    revision
+                    for revision in children_by_parent.get(current.commit_id, ())
+                    if revision.is_reviewable()
+                ]
                 if len(reviewable_children) > 1:
                     raise UnsupportedStackError(
                         f"Unsupported stack shape at {current.change_id}: multiple "
@@ -103,7 +119,9 @@ class JjClient:
             stack_head_first.append(current)
             parent_commit_id = current.only_parent_commit_id()
             child_in_path = current
-            current = self.resolve_revision(parent_commit_id)
+            current = revisions_by_commit_id.get(parent_commit_id) or self.resolve_revision(
+                parent_commit_id
+            )
 
         return LocalStack(
             head=head,
@@ -148,6 +166,20 @@ class JjClient:
 
         revisions = self._query_revisions(f"children('{commit_id}')")
         return [revision for revision in revisions if revision.is_reviewable()]
+
+    def _query_children_by_parent(
+        self,
+        revset: str,
+    ) -> dict[str, tuple[LocalRevision, ...]]:
+        revisions = self._query_revisions(revset)
+        grouped: dict[str, list[LocalRevision]] = {}
+        for revision in revisions:
+            for parent_commit_id in revision.parents:
+                grouped.setdefault(parent_commit_id, []).append(revision)
+        return {
+            parent_commit_id: tuple(children)
+            for parent_commit_id, children in grouped.items()
+        }
 
     def list_git_remotes(self) -> tuple[GitRemote, ...]:
         """List configured Git remotes for the repository."""
@@ -410,3 +442,7 @@ def _require_sequence(value: Any) -> Sequence[str]:
     if not isinstance(value, list | tuple):
         raise JjCommandError("Unexpected `jj bookmark list` payload: expected a sequence.")
     return tuple(str(item) for item in value)
+
+
+def _quote_revset_symbol(symbol: str) -> str:
+    return f"'{symbol}'"

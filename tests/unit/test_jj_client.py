@@ -129,9 +129,10 @@ def test_discover_review_stack_defaults_to_parent_of_empty_working_copy() -> Non
             _EMPTY_WORKING_COPY
         ),
         ("jj", "log", "--no-graph", "-r", "@-", "-T", _template(), "--limit", "2"): _HEAD,
-        ("jj", "log", "--no-graph", "-r", "parent", "-T", _template(), "--limit", "2"): _PARENT,
-        ("jj", "log", "--no-graph", "-r", "trunk", "-T", _template(), "--limit", "2"): _TRUNK,
-        ("jj", "log", "--no-graph", "-r", "children('parent')", "-T", _template()): _HEAD,
+        ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
+            _HEAD + _PARENT + _TRUNK
+        ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): _HEAD,
     }
 
     stack = JjClient(Path("/repo"), runner=_runner(responses)).discover_review_stack()
@@ -181,20 +182,10 @@ def test_discover_review_stack_rejects_immutable_revisions() -> None:
         ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
             _HEAD_ON_IMMUTABLE_PARENT
         ),
-        (
-            "jj",
-            "log",
-            "--no-graph",
-            "-r",
-            "immutable-parent",
-            "-T",
-            _template(),
-            "--limit",
-            "2",
-        ): _IMMUTABLE_PARENT,
-        ("jj", "log", "--no-graph", "-r", "children('immutable-parent')", "-T", _template()): (
-            _HEAD
+        ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
+            _HEAD_ON_IMMUTABLE_PARENT + _IMMUTABLE_PARENT + _TRUNK
         ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): _HEAD,
     }
 
     client = JjClient(Path("/repo"), runner=_runner(responses))
@@ -217,9 +208,10 @@ def test_discover_review_stack_rejects_multiple_reviewable_children() -> None:
     responses: dict[tuple[str, ...], str] = {
         ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
         ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): _HEAD,
-        ("jj", "log", "--no-graph", "-r", "parent", "-T", _template(), "--limit", "2"): _PARENT,
-        ("jj", "log", "--no-graph", "-r", "trunk", "-T", _template(), "--limit", "2"): _TRUNK,
-        ("jj", "log", "--no-graph", "-r", "children('parent')", "-T", _template()): (
+        ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
+            _HEAD + _PARENT + _TRUNK
+        ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): (
             _CHILD_A + _CHILD_B
         ),
     }
@@ -316,11 +308,12 @@ def test_discover_review_stack_excludes_divergent_siblings_from_child_count() ->
     responses: dict[tuple[str, ...], str] = {
         ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
         ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): _HEAD,
-        ("jj", "log", "--no-graph", "-r", "parent", "-T", _template(), "--limit", "2"): _PARENT,
-        ("jj", "log", "--no-graph", "-r", "trunk", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
+            _HEAD + _PARENT + _TRUNK
+        ),
         # parent has one valid child (head) and one divergent sibling — only
         # head is reviewable, so there is no branching conflict.
-        ("jj", "log", "--no-graph", "-r", "children('parent')", "-T", _template()): (
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): (
             _HEAD + _DIVERGENT_SIBLING
         ),
     }
