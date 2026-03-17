@@ -24,8 +24,10 @@ def test_main_time_output_prefixes_help_lines(capsys: pytest.CaptureFixture[str]
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert captured.out.startswith("[")
-    assert "submit" in captured.out
+    lines = [line for line in captured.out.splitlines() if line]
+    assert lines
+    assert all(line.startswith("[") for line in lines)
+    assert any("submit" in line for line in lines)
 
 
 def test_main_reports_invalid_config_without_traceback(

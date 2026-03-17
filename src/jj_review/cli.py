@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import io
 import logging
 import sys
 import time
@@ -155,13 +156,29 @@ def _time_output(*, enabled: bool):
 
     def timed_print(*args, **kwargs) -> None:
         elapsed = time.perf_counter() - start
-        original_print(f"[{elapsed:0.6f}]", *args, **kwargs)
+        destination = kwargs.pop("file", sys.stdout)
+        flush = kwargs.pop("flush", False)
+        end = kwargs.get("end", "\n")
+        buffer = io.StringIO()
+        original_print(*args, file=buffer, flush=False, **kwargs)
+        rendered = buffer.getvalue()
+        if rendered:
+            prefix = f"[{elapsed:0.6f}] "
+            destination.write(_prefix_rendered_lines(rendered, prefix=prefix))
+        elif end:
+            destination.write(f"[{elapsed:0.6f}] {end}")
+        if flush:
+            destination.flush()
 
     builtins.print = cast(Any, timed_print)
     try:
         yield
     finally:
         builtins.print = original_print
+
+
+def _prefix_rendered_lines(rendered: str, *, prefix: str) -> str:
+    return "".join(f"{prefix}{line}" for line in rendered.splitlines(keepends=True))
 
 
 def _status_handler(args: Namespace) -> int:
