@@ -7,15 +7,19 @@ from typing import Any, cast
 from jj_review.commands.cleanup import (
     PreparedCleanup,
     PreparedRestack,
+    _inspect_restack,
+    _inspect_restack_pull_request,
     _should_inspect_stack_comment_cleanup,
     _stream_cleanup_async,
     prepare_restack,
     stream_restack,
 )
+from jj_review.commands.review_state import PreparedStatus
 from jj_review.commands.submit import ResolvedGithubRepository
 from jj_review.config import RepoConfig
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
+from jj_review.models.github import GithubBranchRef, GithubPullRequest
 
 
 def test_should_skip_stack_comment_inspection_for_stale_open_change_without_comment_hint(
@@ -233,6 +237,7 @@ def test_stream_cleanup_emits_cache_actions_before_waiting_for_comment_inspectio
 def test_stream_restack_plans_rebase_for_survivor_above_merged_path_revision(
     monkeypatch,
 ) -> None:
+    inspect_calls: list[PreparedRestack] = []
     merged_revision = SimpleNamespace(
         change_id="merged-change",
         local_divergent=False,
@@ -288,12 +293,11 @@ def test_stream_restack_plans_rebase_for_survivor_above_merged_path_revision(
         ),
     )
 
-    monkeypatch.setattr(
-        "jj_review.commands.cleanup.stream_status",
-        lambda **kwargs: SimpleNamespace(
+    async def fake_inspect_restack(*, prepared_restack):
+        inspect_calls.append(prepared_restack)
+        return SimpleNamespace(
             github_error=None,
             github_repository="octo-org/stacked-review",
-            incomplete=False,
             remote=GitRemote(
                 name="origin",
                 url="git@github.com:octo-org/stacked-review.git",
@@ -301,11 +305,13 @@ def test_stream_restack_plans_rebase_for_survivor_above_merged_path_revision(
             remote_error=None,
             revisions=(merged_revision, survivor_revision),
             selected_revset="@",
-        ),
-    )
+        )
+
+    monkeypatch.setattr("jj_review.commands.cleanup._inspect_restack", fake_inspect_restack)
 
     result = stream_restack(prepared_restack=prepared_restack)
 
+    assert inspect_calls == [prepared_restack]
     assert result.blocked is False
     assert len(result.actions) == 1
     assert result.actions[0].kind == "restack"
@@ -317,6 +323,7 @@ def test_stream_restack_applies_rebase_for_survivor_above_merged_path_revision(
     monkeypatch,
 ) -> None:
     rebase_calls: list[tuple[str, str]] = []
+    inspect_calls: list[PreparedRestack] = []
 
     class FakeClient:
         def resolve_revision(self, revset: str):
@@ -382,12 +389,11 @@ def test_stream_restack_applies_rebase_for_survivor_above_merged_path_revision(
         ),
     )
 
-    monkeypatch.setattr(
-        "jj_review.commands.cleanup.stream_status",
-        lambda **kwargs: SimpleNamespace(
+    async def fake_inspect_restack(*, prepared_restack):
+        inspect_calls.append(prepared_restack)
+        return SimpleNamespace(
             github_error=None,
             github_repository="octo-org/stacked-review",
-            incomplete=False,
             remote=GitRemote(
                 name="origin",
                 url="git@github.com:octo-org/stacked-review.git",
@@ -395,11 +401,13 @@ def test_stream_restack_applies_rebase_for_survivor_above_merged_path_revision(
             remote_error=None,
             revisions=(merged_revision, survivor_revision),
             selected_revset="@",
-        ),
-    )
+        )
+
+    monkeypatch.setattr("jj_review.commands.cleanup._inspect_restack", fake_inspect_restack)
 
     result = stream_restack(prepared_restack=prepared_restack)
 
+    assert inspect_calls == [prepared_restack]
     assert result.blocked is False
     assert rebase_calls == [("survivor-change", "trunk-commit")]
     assert len(result.actions) == 1
@@ -435,3 +443,394 @@ def test_prepare_restack_skips_fetch_remote_state(monkeypatch) -> None:
             "revset": "@-",
         }
     ]
+
+
+def test_inspect_restack_pull_request_uses_cached_pull_request_before_head_lookup() -> None:
+    class FakeGithubClient:
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ):
+            raise AssertionError("head lookup should not run when cached pull request matches")
+
+    lookup = asyncio.run(
+        _inspect_restack_pull_request(
+            bookmark="review/feature-aaaaaaaa",
+            cached_change=CachedChange(
+                bookmark="review/feature-aaaaaaaa",
+                pr_number=7,
+            ),
+            cached_pull_requests={
+                7: GithubPullRequest(
+                    base=GithubBranchRef(ref="review/base-branch"),
+                    head=GithubBranchRef(ref="review/feature-aaaaaaaa"),
+                    html_url="https://github.test/octo-org/stacked-review/pull/7",
+                    merged_at="2026-03-16T12:00:00Z",
+                    number=7,
+                    state="closed",
+                    title="feature 1",
+                )
+            },
+            github_client=cast(Any, FakeGithubClient()),
+            github_repository=ResolvedGithubRepository(
+                host="github.com",
+                owner="octo-org",
+                repo="stacked-review",
+            ),
+            pull_requests_by_head_ref={},
+        )
+    )
+
+    assert lookup.state == "closed"
+    assert lookup.pull_request is not None
+    assert lookup.pull_request.state == "merged"
+
+
+def test_inspect_restack_falls_back_to_head_lookup_when_cached_pull_request_mismatches() -> None:
+    list_calls: list[str] = []
+
+    class FakeGithubClient:
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ):
+            assert owner == "octo-org"
+            assert repo == "stacked-review"
+            assert state == "all"
+            list_calls.append(head)
+            return (
+                GithubPullRequest(
+                    base=GithubBranchRef(ref="main"),
+                    head=GithubBranchRef(ref="review/feature-aaaaaaaa"),
+                    html_url="https://github.test/octo-org/stacked-review/pull/7",
+                    number=7,
+                    state="open",
+                    title="feature 1",
+                ),
+            )
+
+    lookup = asyncio.run(
+        _inspect_restack_pull_request(
+            bookmark="review/feature-aaaaaaaa",
+            cached_change=CachedChange(
+                bookmark="review/feature-aaaaaaaa",
+                pr_number=7,
+            ),
+            cached_pull_requests={
+                7: GithubPullRequest(
+                    base=GithubBranchRef(ref="main"),
+                    head=GithubBranchRef(ref="review/other-branch"),
+                    html_url="https://github.test/octo-org/stacked-review/pull/7",
+                    number=7,
+                    state="open",
+                    title="feature 1",
+                )
+            },
+            github_client=cast(Any, FakeGithubClient()),
+            github_repository=ResolvedGithubRepository(
+                host="github.com",
+                owner="octo-org",
+                repo="stacked-review",
+            ),
+            pull_requests_by_head_ref={},
+        )
+    )
+
+    assert list_calls == ["octo-org:review/feature-aaaaaaaa"]
+    assert lookup.state == "open"
+    assert lookup.pull_request is not None
+    assert lookup.pull_request.number == 7
+
+
+def test_inspect_restack_pull_request_uses_batched_head_lookup_before_rest_lookup() -> None:
+    class FakeGithubClient:
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ):
+            raise AssertionError("REST head lookup should not run when head batch matches")
+
+    lookup = asyncio.run(
+        _inspect_restack_pull_request(
+            bookmark="review/feature-aaaaaaaa",
+            cached_change=None,
+            cached_pull_requests={},
+            github_client=cast(Any, FakeGithubClient()),
+            github_repository=ResolvedGithubRepository(
+                host="github.com",
+                owner="octo-org",
+                repo="stacked-review",
+            ),
+            pull_requests_by_head_ref={
+                "review/feature-aaaaaaaa": (
+                    GithubPullRequest(
+                        base=GithubBranchRef(ref="main"),
+                        head=GithubBranchRef(ref="review/feature-aaaaaaaa"),
+                        html_url="https://github.test/octo-org/stacked-review/pull/7",
+                        number=7,
+                        state="open",
+                        title="feature 1",
+                    ),
+                )
+            },
+        )
+    )
+
+    assert lookup.state == "open"
+    assert lookup.pull_request is not None
+    assert lookup.pull_request.number == 7
+
+
+def test_inspect_restack_batches_cached_pull_request_numbers(monkeypatch) -> None:
+    batch_calls: list[tuple[str, str, tuple[int, ...]]] = []
+    head_calls: list[str] = []
+    remote = GitRemote(name="origin", url="git@github.com:octo-org/stacked-review.git")
+    prepared_status = PreparedStatus(
+        github_repository=ResolvedGithubRepository(
+            host="github.com",
+            owner="octo-org",
+            repo="stacked-review",
+        ),
+        github_repository_error=None,
+        prepared=cast(
+            Any,
+            SimpleNamespace(
+                remote=remote,
+                remote_error=None,
+                status_revisions=(
+                    SimpleNamespace(
+                        bookmark="review/one",
+                        bookmark_source="generated",
+                        cached_change=CachedChange(bookmark="review/one", pr_number=1),
+                        revision=SimpleNamespace(
+                            change_id="change-1",
+                            description="one\n",
+                            divergent=False,
+                            subject="one",
+                        ),
+                    ),
+                    SimpleNamespace(
+                        bookmark="review/two",
+                        bookmark_source="generated",
+                        cached_change=CachedChange(bookmark="review/two", pr_number=2),
+                        revision=SimpleNamespace(
+                            change_id="change-2",
+                            description="two\n",
+                            divergent=False,
+                            subject="two",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        selected_revset="@",
+        trunk_subject="base",
+    )
+
+    class FakeGithubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get_pull_requests_by_numbers(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            pull_numbers,
+        ):
+            batch_calls.append((owner, repo, tuple(pull_numbers)))
+            return {
+                1: GithubPullRequest(
+                    base=GithubBranchRef(ref="main"),
+                    head=GithubBranchRef(ref="review/one"),
+                    html_url="https://github.test/octo-org/stacked-review/pull/1",
+                    number=1,
+                    state="open",
+                    title="one",
+                ),
+                2: GithubPullRequest(
+                    base=GithubBranchRef(ref="review/base"),
+                    head=GithubBranchRef(ref="review/two"),
+                    html_url="https://github.test/octo-org/stacked-review/pull/2",
+                    merged_at="2026-03-16T12:00:00Z",
+                    number=2,
+                    state="closed",
+                    title="two",
+                ),
+            }
+
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ):
+            head_calls.append(head)
+            raise AssertionError("head lookup should not run for cached-number revisions")
+
+    monkeypatch.setattr(
+        "jj_review.commands.cleanup._build_github_client",
+        lambda **kwargs: FakeGithubClient(),
+    )
+
+    inspection = asyncio.run(
+        _inspect_restack(
+            prepared_restack=PreparedRestack(
+                apply=False,
+                prepared_status=prepared_status,
+            )
+        )
+    )
+
+    assert batch_calls == [("octo-org", "stacked-review", (1, 2))]
+    assert head_calls == []
+    assert inspection.revisions[0].pull_request_lookup is not None
+    assert inspection.revisions[1].pull_request_lookup is not None
+    assert inspection.revisions[0].pull_request_lookup.state == "open"
+    assert inspection.revisions[1].pull_request_lookup.state == "closed"
+
+
+def test_inspect_restack_batches_uncached_head_refs(monkeypatch) -> None:
+    batch_head_calls: list[tuple[str, str, tuple[str, ...]]] = []
+    head_calls: list[str] = []
+    remote = GitRemote(name="origin", url="git@github.com:octo-org/stacked-review.git")
+    prepared_status = PreparedStatus(
+        github_repository=ResolvedGithubRepository(
+            host="github.com",
+            owner="octo-org",
+            repo="stacked-review",
+        ),
+        github_repository_error=None,
+        prepared=cast(
+            Any,
+            SimpleNamespace(
+                remote=remote,
+                remote_error=None,
+                status_revisions=(
+                    SimpleNamespace(
+                        bookmark="review/one",
+                        bookmark_source="generated",
+                        cached_change=None,
+                        revision=SimpleNamespace(
+                            change_id="change-1",
+                            description="one\n",
+                            divergent=False,
+                            subject="one",
+                        ),
+                    ),
+                    SimpleNamespace(
+                        bookmark="review/two",
+                        bookmark_source="generated",
+                        cached_change=None,
+                        revision=SimpleNamespace(
+                            change_id="change-2",
+                            description="two\n",
+                            divergent=False,
+                            subject="two",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        selected_revset="@",
+        trunk_subject="base",
+    )
+
+    class FakeGithubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get_pull_requests_by_numbers(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            pull_numbers,
+        ):
+            return {}
+
+        async def get_pull_requests_by_head_refs(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head_refs,
+        ):
+            batch_head_calls.append((owner, repo, tuple(head_refs)))
+            return {
+                "review/one": (
+                    GithubPullRequest(
+                        base=GithubBranchRef(ref="main"),
+                        head=GithubBranchRef(ref="review/one"),
+                        html_url="https://github.test/octo-org/stacked-review/pull/1",
+                        number=1,
+                        state="open",
+                        title="one",
+                    ),
+                ),
+                "review/two": (
+                    GithubPullRequest(
+                        base=GithubBranchRef(ref="review/base"),
+                        head=GithubBranchRef(ref="review/two"),
+                        html_url="https://github.test/octo-org/stacked-review/pull/2",
+                        merged_at="2026-03-16T12:00:00Z",
+                        number=2,
+                        state="closed",
+                        title="two",
+                    ),
+                ),
+            }
+
+        async def list_pull_requests(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head: str,
+            state: str = "all",
+        ):
+            head_calls.append(head)
+            raise AssertionError("REST head lookup should not run for batched head refs")
+
+    monkeypatch.setattr(
+        "jj_review.commands.cleanup._build_github_client",
+        lambda **kwargs: FakeGithubClient(),
+    )
+
+    inspection = asyncio.run(
+        _inspect_restack(
+            prepared_restack=PreparedRestack(
+                apply=False,
+                prepared_status=prepared_status,
+            )
+        )
+    )
+
+    assert batch_head_calls == [
+        ("octo-org", "stacked-review", ("review/one", "review/two"))
+    ]
+    assert head_calls == []
+    assert inspection.revisions[0].pull_request_lookup is not None
+    assert inspection.revisions[1].pull_request_lookup is not None
+    assert inspection.revisions[0].pull_request_lookup.state == "open"
+    assert inspection.revisions[1].pull_request_lookup.state == "closed"

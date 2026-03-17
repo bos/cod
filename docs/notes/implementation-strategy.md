@@ -714,7 +714,16 @@ Done when:
 
 ### Slice 9: Merged PR Reconciliation
 
-Status: planned.
+Status: in progress.
+
+Implemented so far:
+
+- `cleanup --restack` no longer reuses the full `status` GitHub inspection
+  path; it now performs a narrower PR-state-only inspection for the selected
+  path
+- that restack-specific inspection batches GitHub lookups by cached PR number
+  and by uncached head branch so large local stacks do not pay one REST pull
+  request lookup per revision just to plan a restack
 
 Deliver:
 

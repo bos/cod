@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -19,6 +20,7 @@ from jj_review.models.github import (
 )
 
 logger = logging.getLogger(__name__)
+_GRAPHQL_PULL_REQUEST_BATCH_SIZE = 25
 
 _DEFAULT_RATE_LIMIT_RETRIES = 3
 _DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = 1.0
@@ -112,6 +114,91 @@ class GithubClient:
             f"/repos/{owner}/{repo}/pulls/{pull_number}",
         )
         return GithubPullRequest.model_validate(self._expect_success(response))
+
+    async def get_pull_requests_by_numbers(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        pull_numbers: Sequence[int],
+    ) -> dict[int, GithubPullRequest | None]:
+        numbers = sorted(set(pull_numbers))
+        if not numbers:
+            return {}
+
+        results: dict[int, GithubPullRequest | None] = {}
+        for chunk in _chunked(numbers, size=_GRAPHQL_PULL_REQUEST_BATCH_SIZE):
+            query = _pull_requests_by_number_query(chunk)
+            payload = await self._graphql_query(
+                query,
+                variables={"owner": owner, "repo": repo},
+                response_name="pull request batch lookup",
+            )
+            repository = payload.get("repository")
+            if repository is None:
+                raise GithubClientError(
+                    "GitHub pull request batch lookup response was missing repository data."
+                )
+            if not isinstance(repository, dict):
+                raise GithubClientError(
+                    "GitHub pull request batch lookup response had invalid repository data."
+                )
+            for number in chunk:
+                alias = _pull_request_alias(number)
+                raw_pull_request = repository.get(alias)
+                if raw_pull_request is None:
+                    results[number] = None
+                    continue
+                if not isinstance(raw_pull_request, dict):
+                    raise GithubClientError(
+                        "GitHub pull request batch lookup response had invalid pull request "
+                        f"payload for #{number}."
+                    )
+                results[number] = GithubPullRequest.model_validate(
+                    _pull_request_payload_from_graphql(raw_pull_request)
+                )
+        return results
+
+    async def get_pull_requests_by_head_refs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        head_refs: Sequence[str],
+    ) -> dict[str, tuple[GithubPullRequest, ...]]:
+        refs = sorted(set(head_refs))
+        if not refs:
+            return {}
+
+        results: dict[str, tuple[GithubPullRequest, ...]] = {}
+        for chunk in _chunked(refs, size=_GRAPHQL_PULL_REQUEST_BATCH_SIZE):
+            aliases = {
+                _pull_request_head_ref_alias(index): head_ref
+                for index, head_ref in enumerate(chunk)
+            }
+            query = _pull_requests_by_head_ref_query(aliases)
+            payload = await self._graphql_query(
+                query,
+                variables={"owner": owner, "repo": repo},
+                response_name="pull request head lookup",
+            )
+            repository = payload.get("repository")
+            if repository is None:
+                raise GithubClientError(
+                    "GitHub pull request head lookup response was missing repository data."
+                )
+            if not isinstance(repository, dict):
+                raise GithubClientError(
+                    "GitHub pull request head lookup response had invalid repository data."
+                )
+            for alias, head_ref in aliases.items():
+                connection = repository.get(alias)
+                results[head_ref] = _pull_request_connection_from_graphql(
+                    alias=alias,
+                    connection=connection,
+                    response_name="pull request head lookup",
+                )
+        return results
 
     async def create_pull_request(
         self,
@@ -283,6 +370,36 @@ class GithubClient:
 
         return tuple(items)
 
+    async def _graphql_query(
+        self,
+        query: str,
+        *,
+        response_name: str,
+        variables: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        response = await self._request(
+            "POST",
+            "/graphql",
+            json={
+                "query": query,
+                "variables": variables or {},
+            },
+        )
+        payload = self._expect_success(response)
+        if not isinstance(payload, dict):
+            raise GithubClientError(
+                f"GitHub {response_name} response was not a JSON object."
+            )
+        errors = payload.get("errors")
+        if errors:
+            raise GithubClientError(f"GitHub {response_name} failed: {errors}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise GithubClientError(
+                f"GitHub {response_name} response was missing `data`."
+            )
+        return data
+
     def _expect_success(self, response: httpx.Response) -> Any:
         try:
             response.raise_for_status()
@@ -366,3 +483,115 @@ def _seconds_until_rate_limit_reset(value: str | None) -> float | None:
         return max(float(value) - time.time(), 0.0)
     except ValueError:
         return None
+
+
+def _chunked[ChunkValue](
+    values: Sequence[ChunkValue], *, size: int
+) -> list[tuple[ChunkValue, ...]]:
+    return [tuple(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _pull_request_alias(number: int) -> str:
+    return f"pr_{number}"
+
+
+def _pull_request_head_ref_alias(index: int) -> str:
+    return f"head_{index}"
+
+
+def _pull_requests_by_number_query(numbers: Sequence[int]) -> str:
+    selections = "\n".join(
+        (
+            f"      {_pull_request_alias(number)}: pullRequest(number: {number}) {{\n"
+            "        number\n"
+            "        state\n"
+            "        mergedAt\n"
+            "        url\n"
+            "        title\n"
+            "        body\n"
+            "        baseRefName\n"
+            "        headRefName\n"
+            "      }"
+        )
+        for number in numbers
+    )
+    return (
+        "query PullRequestsByNumber($owner: String!, $repo: String!) {\n"
+        "  repository(owner: $owner, name: $repo) {\n"
+        f"{selections}\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def _pull_requests_by_head_ref_query(aliases: dict[str, str]) -> str:
+    selections = "\n".join(
+        (
+            f"    {alias}: pullRequests("
+            f'first: 2, states: [OPEN, CLOSED], headRefName: {json.dumps(head_ref)}) {{\n'
+            "      nodes {\n"
+            "        number\n"
+            "        state\n"
+            "        mergedAt\n"
+            "        url\n"
+            "        title\n"
+            "        body\n"
+            "        baseRefName\n"
+            "        headRefName\n"
+            "      }\n"
+            "    }"
+        )
+        for alias, head_ref in aliases.items()
+    )
+    return (
+        "query PullRequestsByHeadRef($owner: String!, $repo: String!) {\n"
+        "  repository(owner: $owner, name: $repo) {\n"
+        f"{selections}\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+def _pull_request_payload_from_graphql(raw_pull_request: dict[str, object]) -> dict[str, object]:
+    return {
+        "base": {"ref": raw_pull_request.get("baseRefName")},
+        "body": raw_pull_request.get("body"),
+        "head": {"ref": raw_pull_request.get("headRefName")},
+        "html_url": raw_pull_request.get("url"),
+        "merged_at": raw_pull_request.get("mergedAt"),
+        "number": raw_pull_request.get("number"),
+        "state": str(raw_pull_request.get("state", "")).lower(),
+        "title": raw_pull_request.get("title"),
+    }
+
+
+def _pull_request_connection_from_graphql(
+    *,
+    alias: str,
+    connection: object,
+    response_name: str,
+) -> tuple[GithubPullRequest, ...]:
+    if connection is None:
+        return ()
+    if not isinstance(connection, dict):
+        raise GithubClientError(
+            f"GitHub {response_name} response had invalid connection payload for {alias!r}."
+        )
+    raw_nodes = connection.get("nodes")
+    if raw_nodes is None:
+        return ()
+    if not isinstance(raw_nodes, list):
+        raise GithubClientError(
+            f"GitHub {response_name} response had invalid node payload for {alias!r}."
+        )
+    pull_requests: list[GithubPullRequest] = []
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict):
+            raise GithubClientError(
+                f"GitHub {response_name} response had invalid pull request payload for "
+                f"{alias!r}."
+            )
+        pull_requests.append(
+            GithubPullRequest.model_validate(_pull_request_payload_from_graphql(raw_node))
+        )
+    return tuple(pull_requests)
