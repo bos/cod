@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import httpx
+import pytest
 
 from jj_review.cache import ReviewStateStore, resolve_state_path
 from jj_review.cli import main
@@ -16,6 +17,16 @@ from jj_review.testing.fake_github import (
     create_app,
     initialize_bare_repository,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_jj_user_config(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    xdg_config_home = tmp_path / "xdg-config"
+    home.mkdir()
+    xdg_config_home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config_home))
 
 
 def test_submit_projects_review_bookmarks_to_selected_remote(
