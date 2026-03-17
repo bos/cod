@@ -7,6 +7,7 @@ import pytest
 
 from jj_review.cli import main
 from jj_review.config import CONFIG_DIRNAME, CONFIG_FILENAME
+from jj_review.jj import UnsupportedStackError
 from jj_review.models.bookmarks import BookmarkState
 
 
@@ -204,6 +205,31 @@ def test_main_status_short_fetch_alias_passes_fetch_to_prepare_status(
     assert exit_code == 0
     assert "No reviewable commits" in captured.out
     assert prepare_calls == [True]
+
+
+def test_main_status_reports_targeted_divergent_stack_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+
+    def raise_unsupported_stack(**kwargs):
+        raise UnsupportedStackError(
+            "Unsupported stack shape at nznokxmvrnysowwwkktpmroswxqsozqq: "
+            "divergent changes are not supported."
+        )
+
+    monkeypatch.setattr("jj_review.cli.prepare_status", raise_unsupported_stack)
+
+    exit_code = main(["status", "--repository", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Could not inspect review status" in captured.err
+    assert "Unsupported stack shape at nznokxmvrnysowwwkktpmroswxqsozqq" in captured.err
+    assert "jj log -r 'change_id(nznokxmvrnysowwwkktpmroswxqsozqq)'" in captured.err
+    assert "`status --fetch` or another fetch imports remote bookmark updates" in captured.err
 
 
 def test_main_cleanup_passes_apply_to_prepare_cleanup(

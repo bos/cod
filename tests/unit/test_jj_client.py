@@ -176,6 +176,43 @@ def test_discover_review_stack_rejects_divergent_changes() -> None:
         client.discover_review_stack("divergent")
 
 
+def test_discover_review_stack_allows_divergent_ancestor_for_inspection() -> None:
+    divergent_parent = _revision_line(
+        commit_id="div-parent",
+        parents=["parent"],
+        change_id="div-parent-change",
+        description="div parent\n",
+        divergent=True,
+    )
+    head = _revision_line(
+        commit_id="head-2",
+        parents=["div-parent"],
+        change_id="head-2-change",
+        description="head 2\n",
+    )
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "head-2", "-T", _template(), "--limit", "2"): head,
+        ("jj", "log", "--no-graph", "-r", "::'head-2'", "-T", _template()): (
+            head + divergent_parent + _PARENT + _TRUNK
+        ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head-2')", "-T", _template()): (
+            head + divergent_parent
+        ),
+    }
+
+    stack = JjClient(Path("/repo"), runner=_runner(responses)).discover_review_stack(
+        "head-2",
+        allow_divergent=True,
+    )
+
+    assert [revision.subject for revision in stack.revisions] == [
+        "parent",
+        "div parent",
+        "head 2",
+    ]
+
+
 def test_discover_review_stack_rejects_immutable_revisions() -> None:
     responses: dict[tuple[str, ...], str] = {
         ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
@@ -185,12 +222,94 @@ def test_discover_review_stack_rejects_immutable_revisions() -> None:
         ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
             _HEAD_ON_IMMUTABLE_PARENT + _IMMUTABLE_PARENT + _TRUNK
         ),
-        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): _HEAD,
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): (
+            _HEAD_ON_IMMUTABLE_PARENT
+        ),
     }
 
     client = JjClient(Path("/repo"), runner=_runner(responses))
     with pytest.raises(UnsupportedStackError, match="immutable commits are not reviewable"):
         client.discover_review_stack("head")
+
+
+def test_discover_review_stack_allows_immutable_ancestor_for_inspection() -> None:
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): _TRUNK,
+        ("jj", "log", "--no-graph", "-r", "head", "-T", _template(), "--limit", "2"): (
+            _HEAD_ON_IMMUTABLE_PARENT
+        ),
+        ("jj", "log", "--no-graph", "-r", "::'head'", "-T", _template()): (
+            _HEAD_ON_IMMUTABLE_PARENT + _IMMUTABLE_PARENT + _TRUNK
+        ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head')", "-T", _template()): (
+            _HEAD_ON_IMMUTABLE_PARENT
+        ),
+    }
+
+    stack = JjClient(Path("/repo"), runner=_runner(responses)).discover_review_stack(
+        "head",
+        allow_immutable=True,
+    )
+
+    assert [revision.subject for revision in stack.revisions] == [
+        "immutable parent",
+        "head",
+    ]
+
+
+def test_discover_review_stack_stops_at_first_path_revision_already_in_trunk() -> None:
+    current_trunk = _revision_line(
+        commit_id="current-trunk",
+        parents=["old-trunk", "merged"],
+        change_id="trunk-change",
+        description="main\n",
+    )
+    merged = _revision_line(
+        commit_id="merged",
+        parents=["old-trunk"],
+        change_id="merged-change",
+        description="merged\n",
+        immutable=True,
+    )
+    head = _revision_line(
+        commit_id="head-3",
+        parents=["merged"],
+        change_id="head-3-change",
+        description="head 3\n",
+    )
+    old_trunk = _revision_line(
+        commit_id="old-trunk",
+        parents=["root"],
+        change_id="old-trunk-change",
+        description="old trunk\n",
+        immutable=True,
+    )
+    responses: dict[tuple[str, ...], str] = {
+        ("jj", "log", "--no-graph", "-r", "trunk()", "-T", _template(), "--limit", "2"): (
+            current_trunk
+        ),
+        ("jj", "log", "--no-graph", "-r", "head-3", "-T", _template(), "--limit", "2"): head,
+        ("jj", "log", "--no-graph", "-r", "::'current-trunk'", "-T", _template()): (
+            current_trunk + merged + old_trunk + _ROOT
+        ),
+        ("jj", "log", "--no-graph", "-r", "::'head-3'", "-T", _template()): (
+            head + merged + old_trunk + _ROOT
+        ),
+        ("jj", "log", "--no-graph", "-r", "children(::'head-3')", "-T", _template()): (
+            head + merged
+        ),
+    }
+
+    stack = JjClient(Path("/repo"), runner=_runner(responses)).discover_review_stack(
+        "head-3",
+        allow_immutable=True,
+        allow_trunk_ancestors=True,
+    )
+
+    assert [revision.subject for revision in stack.revisions] == [
+        "merged",
+        "head 3",
+    ]
 
 
 def test_discover_review_stack_rejects_hidden_revisions() -> None:

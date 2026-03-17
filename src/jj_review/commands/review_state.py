@@ -66,6 +66,7 @@ class ReviewStatusRevision:
     bookmark_source: BookmarkSource
     cached_change: CachedChange | None
     change_id: str
+    local_divergent: bool
     pull_request_lookup: PullRequestLookup | None
     remote_state: RemoteBookmarkState | None
     stack_comment_lookup: StackCommentLookup | None
@@ -338,7 +339,12 @@ def _prepare_stack(
     revset: str | None,
 ) -> _PreparedStack:
     client = JjClient(repo_root)
-    stack = client.discover_review_stack(revset)
+    stack = client.discover_review_stack(
+        revset,
+        allow_divergent=True,
+        allow_immutable=True,
+        allow_trunk_ancestors=True,
+    )
     state_store = ReviewStateStore.for_repo(repo_root)
     state = state_store.load()
     remotes = client.list_git_remotes()
@@ -416,6 +422,7 @@ def _build_status_revisions_without_github(
             bookmark_source=revision.bookmark_source,
             cached_change=revision.cached_change,
             change_id=revision.revision.change_id,
+            local_divergent=getattr(revision.revision, "divergent", False),
             pull_request_lookup=None,
             remote_state=(
                 prepared.client.get_bookmark_state(revision.bookmark).remote_target(
@@ -659,6 +666,7 @@ async def _inspect_revision_with_github(
             bookmark_source=prepared_revision.bookmark_source,
             cached_change=prepared_revision.cached_change,
             change_id=prepared_revision.revision.change_id,
+            local_divergent=getattr(prepared_revision.revision, "divergent", False),
             pull_request_lookup=pull_request_lookup,
             remote_state=remote_state,
             stack_comment_lookup=stack_comment_lookup,

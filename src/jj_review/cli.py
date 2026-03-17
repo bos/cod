@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import io
 import logging
+import re
 import sys
 import time
 from argparse import SUPPRESS, ArgumentParser, Namespace, _SubParsersAction
@@ -20,9 +21,11 @@ from jj_review.commands.cleanup import prepare_cleanup, stream_cleanup
 from jj_review.commands.review_state import prepare_status, stream_status
 from jj_review.commands.submit import run_submit
 from jj_review.errors import CliError, CommandNotImplementedError
+from jj_review.jj import UnsupportedStackError
 
 logger = logging.getLogger(__name__)
 _DISPLAY_CHANGE_ID_LENGTH = 8
+_UNSUPPORTED_STACK_CHANGE_RE = re.compile(r"^Unsupported stack shape at (\w+): (.+)$")
 
 
 def build_parser() -> ArgumentParser:
@@ -190,13 +193,16 @@ def _prefix_rendered_lines(rendered: str, *, prefix: str) -> str:
 
 def _status_handler(args: Namespace) -> int:
     context = bootstrap_context(args)
-    prepared_status = prepare_status(
-        change_overrides=context.config.change,
-        config=context.config.repo,
-        fetch_remote_state=args.fetch,
-        repo_root=context.repo_root,
-        revset=args.revset,
-    )
+    try:
+        prepared_status = prepare_status(
+            change_overrides=context.config.change,
+            config=context.config.repo,
+            fetch_remote_state=args.fetch,
+            repo_root=context.repo_root,
+            revset=args.revset,
+        )
+    except UnsupportedStackError as error:
+        raise CliError(_describe_status_preparation_error(error)) from error
     prepared = prepared_status.prepared
     print(f"Selected revset: {prepared_status.selected_revset}")
     if prepared.remote is None:
@@ -253,6 +259,32 @@ def _status_handler(args: Namespace) -> int:
         )
     )
     return 1 if result.incomplete else 0
+
+
+def _describe_status_preparation_error(error: UnsupportedStackError) -> str:
+    message = str(error)
+    match = _UNSUPPORTED_STACK_CHANGE_RE.match(message)
+    if match is None:
+        return (
+            "Could not inspect review status because local history no longer forms a "
+            f"supported linear stack. {message}"
+        )
+
+    change_id, reason = match.groups()
+    if reason == "divergent changes are not supported.":
+        return (
+            "Could not inspect review status because local history no longer forms a "
+            f"supported linear stack. {message} Inspect the divergent revisions with "
+            f"`jj log -r 'change_id({change_id})'` and reconcile them before retrying. "
+            "This can happen after `status --fetch` or another fetch imports remote "
+            "bookmark updates for merged PRs."
+        )
+    return (
+        "Could not inspect review status because local history no longer forms a "
+        f"supported linear stack. {message}"
+    )
+
+
 def _format_trunk_status_row(
     prepared,
     *,
@@ -350,6 +382,17 @@ def _format_status_summary(revision, *, github_available: bool) -> str:
             summary = f"{cached_label}, {message}"
         else:
             summary = message
+
+    if getattr(revision, "local_divergent", False):
+        if (
+            lookup is not None
+            and lookup.state == "closed"
+            and lookup.pull_request is not None
+            and lookup.pull_request.state == "merged"
+        ):
+            summary = f"{summary}, cleanup needed"
+        else:
+            summary = f"{summary}, multiple visible revisions"
 
     stack_comment_lookup = revision.stack_comment_lookup
     if stack_comment_lookup is not None and stack_comment_lookup.state in {

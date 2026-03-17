@@ -27,14 +27,20 @@ class LocalRevision(BaseModel):
         first_line = self.description.splitlines()[0] if self.description else ""
         return first_line or "(no description set)"
 
-    def is_reviewable(self) -> bool:
+    def is_reviewable(
+        self,
+        *,
+        allow_divergent: bool = False,
+        allow_immutable: bool = False,
+    ) -> bool:
         """Whether the revision should count as a review unit."""
 
         return (
             not self.hidden
-            and not self.immutable
-            and not self.divergent
+            and (allow_immutable or not self.immutable)
+            and (allow_divergent or not self.divergent)
             and not (self.current_working_copy and self.empty)
+            and len(self.parents) == 1
         )
 
     def only_parent_commit_id(self) -> str:

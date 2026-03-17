@@ -6,8 +6,10 @@ from typing import cast
 
 from jj_review.commands.review_state import (
     PreparedStatus,
+    PullRequestLookup,
     ReviewStatusRevision,
     _PreparedStack,
+    _status_is_incomplete,
     _stream_status_async,
 )
 from jj_review.commands.submit import ResolvedGithubRepository
@@ -15,6 +17,7 @@ from jj_review.config import RepoConfig
 from jj_review.errors import CliError
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import ReviewState
+from jj_review.models.github import GithubBranchRef, GithubPullRequest
 from jj_review.models.stack import LocalRevision, LocalStack
 
 
@@ -46,6 +49,7 @@ def test_stream_status_streams_local_fallback_revisions_after_github_abort(
             bookmark_source="generated",
             cached_change=None,
             change_id="aaaaaaaaaaaa",
+            local_divergent=False,
             pull_request_lookup=None,
             remote_state=None,
             stack_comment_lookup=None,
@@ -56,6 +60,7 @@ def test_stream_status_streams_local_fallback_revisions_after_github_abort(
             bookmark_source="generated",
             cached_change=None,
             change_id="bbbbbbbbbbbb",
+            local_divergent=False,
             pull_request_lookup=None,
             remote_state=None,
             stack_comment_lookup=None,
@@ -150,6 +155,36 @@ def test_stream_status_reports_uninspected_github_target_for_empty_stack() -> No
     assert result.revisions == ()
 
 
+def test_status_treats_cleanup_needed_after_merged_pr_as_informational() -> None:
+    revision = ReviewStatusRevision(
+        bookmark="review/feature-1-aaaaaaaa",
+        bookmark_source="generated",
+        cached_change=None,
+        change_id="aaaaaaaaaaaa",
+        local_divergent=True,
+        pull_request_lookup=PullRequestLookup(
+            message=None,
+            pull_request=GithubPullRequest(
+                base=GithubBranchRef(ref="main"),
+                head=GithubBranchRef(ref="review/feature-1-aaaaaaaa"),
+                html_url="https://github.test/octo-org/stacked-review/pull/1",
+                number=1,
+                state="merged",
+                title="feature 1",
+            ),
+            repository_error=None,
+            review_decision=None,
+            review_decision_error=None,
+            state="closed",
+        ),
+        remote_state=None,
+        stack_comment_lookup=None,
+        subject="feature 1",
+    )
+
+    assert _status_is_incomplete((revision,)) is False
+
+
 def test_stream_status_marks_missing_remote_as_incomplete() -> None:
     prepared_status = PreparedStatus(
         github_repository=None,
@@ -181,6 +216,7 @@ def test_stream_status_marks_missing_remote_as_incomplete() -> None:
             bookmark_source="generated",
             cached_change=None,
             change_id="aaaaaaaaaaaa",
+            local_divergent=False,
             pull_request_lookup=None,
             remote_state=None,
             stack_comment_lookup=None,
@@ -235,6 +271,7 @@ def test_stream_status_marks_missing_github_target_as_incomplete(monkeypatch) ->
             bookmark_source="generated",
             cached_change=None,
             change_id="aaaaaaaaaaaa",
+            local_divergent=False,
             pull_request_lookup=None,
             remote_state=None,
             stack_comment_lookup=None,
@@ -300,8 +337,18 @@ def test_prepare_status_fetches_before_remote_bookmark_discovery(
         def __init__(self) -> None:
             self.fetched = False
 
-        def discover_review_stack(self, revset):
+        def discover_review_stack(
+            self,
+            revset,
+            *,
+            allow_divergent=False,
+            allow_immutable=False,
+            allow_trunk_ancestors=False,
+        ):
             assert revset is None
+            assert allow_divergent is True
+            assert allow_immutable is True
+            assert allow_trunk_ancestors is True
             return stack
 
         def list_git_remotes(self):

@@ -56,7 +56,14 @@ class JjClient:
         self._repo_root = repo_root
         self._runner = runner or _default_runner
 
-    def discover_review_stack(self, revset: str | None = None) -> LocalStack:
+    def discover_review_stack(
+        self,
+        revset: str | None = None,
+        *,
+        allow_divergent: bool = False,
+        allow_immutable: bool = False,
+        allow_trunk_ancestors: bool = False,
+    ) -> LocalStack:
         """Resolve a review stack from a selected head back to `trunk()`."""
 
         trunk = self._resolve_trunk()
@@ -79,7 +86,20 @@ class JjClient:
                 trunk=trunk,
             )
 
-        self._validate_reviewable_revision(head)
+        trunk_ancestor_commit_ids: set[str] = set()
+        if allow_trunk_ancestors:
+            trunk_ancestors_revset = f"::{_quote_revset_symbol(trunk.commit_id)}"
+            trunk_ancestor_commit_ids = {
+                revision.commit_id
+                for revision in self._query_revisions(trunk_ancestors_revset)
+            }
+            trunk_ancestor_commit_ids.add(trunk.commit_id)
+
+        self._validate_reviewable_revision(
+            head,
+            allow_divergent=allow_divergent,
+            allow_immutable=allow_immutable,
+        )
         ancestor_revisions = self._query_revisions(f"::{_quote_revset_symbol(head.commit_id)}")
         revisions_by_commit_id = {
             revision.commit_id: revision for revision in ancestor_revisions
@@ -95,12 +115,26 @@ class JjClient:
         current = head
         while current.commit_id != trunk.commit_id:
             if current.commit_id != head.commit_id:
-                self._validate_reviewable_revision(current)
+                self._validate_reviewable_revision(
+                    current,
+                    allow_divergent=allow_divergent,
+                    allow_immutable=allow_immutable,
+                )
             if child_in_path is not None:
                 reviewable_children = [
                     revision
                     for revision in children_by_parent.get(current.commit_id, ())
-                    if revision.is_reviewable()
+                    if (
+                        revision.commit_id == child_in_path.commit_id
+                        and revision.is_reviewable(
+                            allow_divergent=allow_divergent,
+                            allow_immutable=allow_immutable,
+                        )
+                    )
+                    or (
+                        revision.commit_id != child_in_path.commit_id
+                        and revision.is_reviewable()
+                    )
                 ]
                 if len(reviewable_children) > 1:
                     raise UnsupportedStackError(
@@ -117,6 +151,8 @@ class JjClient:
                     )
 
             stack_head_first.append(current)
+            if allow_trunk_ancestors and current.commit_id in trunk_ancestor_commit_ids:
+                break
             parent_commit_id = current.only_parent_commit_id()
             child_in_path = current
             current = revisions_by_commit_id.get(parent_commit_id) or self.resolve_revision(
@@ -382,7 +418,13 @@ class JjClient:
             raise JjCommandError(f"{shlex.join(command)} failed: {message}")
         return completed.stdout
 
-    def _validate_reviewable_revision(self, revision: LocalRevision) -> None:
+    def _validate_reviewable_revision(
+        self,
+        revision: LocalRevision,
+        *,
+        allow_divergent: bool = False,
+        allow_immutable: bool = False,
+    ) -> None:
         # Check the root-commit condition before immutable, because the root
         # is always immutable in jj and "reached root before trunk()" is more
         # actionable than "immutable commit".
@@ -396,12 +438,12 @@ class JjClient:
                 f"Unsupported stack shape at {revision.change_id}: hidden commits are not "
                 "reviewable."
             )
-        if revision.immutable:
+        if revision.immutable and not allow_immutable:
             raise UnsupportedStackError(
                 f"Unsupported stack shape at {revision.change_id}: immutable commits are not "
                 "reviewable."
             )
-        if revision.divergent:
+        if revision.divergent and not allow_divergent:
             raise UnsupportedStackError(
                 f"Unsupported stack shape at {revision.change_id}: divergent changes are not "
                 "supported."

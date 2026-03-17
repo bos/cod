@@ -362,6 +362,13 @@ than a source of truth.
 `jj review status --fetch [<revset>]` is the same inspection command, but it
 refreshes remote bookmark observations first so the report reflects the latest
 remote state before it inspects GitHub linkage.
+If that refreshed local view reveals local divergence on an ancestor while the
+selected commit-parent path is still linear, status should continue, surface
+that fetched GitHub state inline on the affected change as cleanup needed
+rather than treating the stack as broken. If refresh reveals that the selected
+history no longer has any supported linear walk at all, status should fail
+closed with a targeted local diagnostic rather than a traceback or an
+unadorned subprocess error.
 Unlike `submit`, it may fall back to local-only reporting when the
 repo is not configured well enough to resolve a remote or GitHub target.
 Its default output should stay concise and summarize the effective review state
