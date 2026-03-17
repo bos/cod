@@ -104,3 +104,44 @@ def test_stream_status_streams_local_fallback_revisions_after_github_abort(
         local_only_revisions[1],
         local_only_revisions[0],
     )
+
+
+def test_stream_status_reports_uninspected_github_target_for_empty_stack() -> None:
+    remote = GitRemote(name="origin", url="git@github.com:octo-org/stacked-review.git")
+    prepared_status = PreparedStatus(
+        github_repository=ResolvedGithubRepository(
+            host="github.com",
+            owner="octo-org",
+            repo="stacked-review",
+        ),
+        github_repository_error=None,
+        prepared=cast(
+            _PreparedStack,
+            SimpleNamespace(
+                remote=remote,
+                remote_error=None,
+                status_revisions=(),
+            ),
+        ),
+        selected_revset="main",
+        trunk_subject="base",
+    )
+    github_status_calls: list[tuple[str | None, str | None]] = []
+
+    result = asyncio.run(
+        _stream_status_async(
+            on_github_status=lambda github_repository, github_error: github_status_calls.append(
+                (github_repository, github_error)
+            ),
+            on_revision=None,
+            prepared_status=prepared_status,
+        )
+    )
+
+    assert github_status_calls == [
+        ("octo-org/stacked-review", "not inspected; no reviewable commits")
+    ]
+    assert result.github_error is None
+    assert result.github_repository == "octo-org/stacked-review"
+    assert result.incomplete is False
+    assert result.revisions == ()

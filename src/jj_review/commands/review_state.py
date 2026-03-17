@@ -275,7 +275,11 @@ async def _stream_status_async(
             on_github_status(github_repository.full_name, github_error)
 
     if not prepared.status_revisions:
-        emit_github_status(None)
+        if on_github_status is not None:
+            on_github_status(
+                github_repository.full_name,
+                "not inspected; no reviewable commits",
+            )
         return StatusResult(
             github_error=None,
             github_repository=github_repository.full_name,

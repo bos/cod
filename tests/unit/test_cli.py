@@ -120,6 +120,55 @@ def test_main_accepts_global_options_after_subcommand(
     assert "Traceback" not in captured.err
 
 
+def test_main_status_reports_uninspected_github_target_for_empty_stack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("jj_review.bootstrap.resolve_repo_root", lambda _: tmp_path)
+    monkeypatch.setattr(
+        "jj_review.cli.prepare_status",
+        lambda **kwargs: SimpleNamespace(
+            prepared=SimpleNamespace(
+                client=SimpleNamespace(list_bookmark_states=lambda: {}),
+                remote=SimpleNamespace(name="origin"),
+                remote_error=None,
+                stack=SimpleNamespace(
+                    trunk=SimpleNamespace(
+                        change_id="trunkchangeid",
+                        commit_id="trunk-commit",
+                        subject="base",
+                    )
+                ),
+                status_revisions=(),
+            ),
+            github_repository=SimpleNamespace(full_name="octo-org/stacked-review"),
+            github_repository_error=None,
+            selected_revset="main",
+            trunk_subject="base",
+        ),
+    )
+
+    def fake_stream_status(**kwargs):
+        kwargs["on_github_status"](
+            "octo-org/stacked-review",
+            "not inspected; no reviewable commits",
+        )
+        return SimpleNamespace(incomplete=False)
+
+    monkeypatch.setattr("jj_review.cli.stream_status", fake_stream_status)
+
+    exit_code = main(["status", "--repository", str(tmp_path), "main"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert (
+        "GitHub target: octo-org/stacked-review "
+        "(not inspected; no reviewable commits)"
+    ) in captured.out
+    assert "No reviewable commits" in captured.out
+
+
 def test_main_time_output_prefixes_status_lines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
