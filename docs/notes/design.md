@@ -506,6 +506,8 @@ version = 1
 [change."<full-change-id>"]
 bookmark = "review/fix-cache-invalidation-ypvmkkuo"
 pr_number = 123
+pr_review_decision = "approved"
+pr_state = "open"
 pr_url = "https://github.com/org/repo/pull/123"
 stack_comment_id = 456789
 ```
@@ -521,6 +523,8 @@ Semantics:
 - missing entry means "reuse any discoverable bookmark or PR state, otherwise
   generate defaults"
 - present entry means "reuse cached generated state if still consistent"
+- cached `pr_state` and `pr_review_decision` are advisory last-known GitHub
+  observations for status rendering, not a source of truth
 - deleting the file must never break the review stack model, though it may
   force rediscovery or manual reattachment of review bookmarks
 
