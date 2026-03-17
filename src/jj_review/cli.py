@@ -99,6 +99,11 @@ def build_parser() -> ArgumentParser:
         help="Preview or apply a local restack for merged review units on the selected path.",
     )
     cleanup_parser.add_argument(
+        "--allow-nontrunk-rebase",
+        action="store_true",
+        help="Allow cleanup --restack --apply to rebase onto surviving review changes",
+    )
+    cleanup_parser.add_argument(
         "revset",
         nargs="?",
         help="Revision whose stack should be inspected or restacked.",
@@ -592,6 +597,7 @@ def _cleanup_handler(args: Namespace) -> int:
         try:
             prepared_restack = prepare_restack(
                 apply=bool(args.apply),
+                allow_nontrunk_rebase=bool(args.allow_nontrunk_rebase),
                 change_overrides=context.config.change,
                 config=context.config.repo,
                 repo_root=context.repo_root,
@@ -637,9 +643,18 @@ def _cleanup_handler(args: Namespace) -> int:
             prepared_restack=prepared_restack,
         )
         if not result.actions:
-            print("No merged review units on the selected path need restacking.")
+            print("No merged review units on the selected path need restacking")
             return 0
-        if not result.applied:
+        if result.requires_nontrunk_rebase:
+            rerun_command = (
+                "cleanup --restack --apply --allow-nontrunk-rebase"
+                f"{' ' + result.selected_revset if result.selected_revset else ''}"
+            )
+            print(
+                "Manual follow-up: run `jj rebase` for the blocked non-trunk restack, "
+                f"or rerun with `{rerun_command}`"
+            )
+        elif not result.applied:
             print(
                 "Re-run with `cleanup --restack --apply"
                 f"{' ' + result.selected_revset if result.selected_revset else ''}` "

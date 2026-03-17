@@ -266,6 +266,7 @@ def test_stream_restack_plans_rebase_for_survivor_above_merged_path_revision(
     )
     prepared_restack = PreparedRestack(
         apply=False,
+        allow_nontrunk_rebase=False,
         prepared_status=cast(
             Any,
             SimpleNamespace(
@@ -362,6 +363,7 @@ def test_stream_restack_applies_rebase_for_survivor_above_merged_path_revision(
     )
     prepared_restack = PreparedRestack(
         apply=True,
+        allow_nontrunk_rebase=False,
         prepared_status=cast(
             Any,
             SimpleNamespace(
@@ -427,6 +429,7 @@ def test_prepare_restack_skips_fetch_remote_state(monkeypatch) -> None:
 
     result = prepare_restack(
         apply=False,
+        allow_nontrunk_rebase=False,
         change_overrides={},
         config=RepoConfig(),
         repo_root=cast(Any, "/repo"),
@@ -434,6 +437,7 @@ def test_prepare_restack_skips_fetch_remote_state(monkeypatch) -> None:
     )
 
     assert result.apply is False
+    assert result.allow_nontrunk_rebase is False
     assert prepare_calls == [
         {
             "change_overrides": {},
@@ -443,6 +447,251 @@ def test_prepare_restack_skips_fetch_remote_state(monkeypatch) -> None:
             "revset": "@-",
         }
     ]
+
+
+def test_stream_restack_blocks_nontrunk_rebase_without_override(
+    monkeypatch,
+) -> None:
+    inspect_calls: list[PreparedRestack] = []
+    open_base_revision = SimpleNamespace(
+        change_id="open-base",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="main"),
+                number=1,
+                state="open",
+            ),
+            state="open",
+        ),
+        subject="open base",
+    )
+    merged_revision = SimpleNamespace(
+        change_id="merged-change",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="review/open-base"),
+                number=2,
+                state="merged",
+            ),
+            state="closed",
+        ),
+        subject="merged middle",
+    )
+    top_revision = SimpleNamespace(
+        change_id="top-change",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="review/merged-middle"),
+                number=3,
+                state="open",
+            ),
+            state="open",
+        ),
+        subject="top survivor",
+    )
+    prepared_restack = PreparedRestack(
+        apply=False,
+        allow_nontrunk_rebase=False,
+        prepared_status=cast(
+            Any,
+            SimpleNamespace(
+                prepared=SimpleNamespace(
+                    client=SimpleNamespace(),
+                    stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk-commit")),
+                    status_revisions=(
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="open-base",
+                                commit_id="open-base-commit",
+                                only_parent_commit_id=lambda: "trunk-commit",
+                            )
+                        ),
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="merged-change",
+                                commit_id="merged-commit",
+                                only_parent_commit_id=lambda: "open-base-commit",
+                            )
+                        ),
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="top-change",
+                                commit_id="top-commit",
+                                only_parent_commit_id=lambda: "merged-commit",
+                            )
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    async def fake_inspect_restack(*, prepared_restack):
+        inspect_calls.append(prepared_restack)
+        return SimpleNamespace(
+            github_error=None,
+            github_repository="octo-org/stacked-review",
+            remote=GitRemote(
+                name="origin",
+                url="git@github.com:octo-org/stacked-review.git",
+            ),
+            remote_error=None,
+            revisions=(open_base_revision, merged_revision, top_revision),
+            selected_revset="@",
+        )
+
+    monkeypatch.setattr("jj_review.commands.cleanup._inspect_restack", fake_inspect_restack)
+
+    result = stream_restack(prepared_restack=prepared_restack)
+
+    assert inspect_calls == [prepared_restack]
+    assert result.blocked is True
+    assert result.requires_nontrunk_rebase is True
+    assert len(result.actions) == 2
+    assert result.actions[0].message == (
+        "rebase top-chan onto open-bas requires --allow-nontrunk-rebase"
+    )
+    assert result.actions[0].status == "blocked"
+    assert result.actions[1].message == (
+        "PR #2 merged into review branch review/open-base; configure GitHub to block "
+        "merges of PRs targeting `review/*`"
+    )
+
+
+def test_stream_restack_applies_nontrunk_rebase_with_override(
+    monkeypatch,
+) -> None:
+    rebase_calls: list[tuple[str, str]] = []
+    inspect_calls: list[PreparedRestack] = []
+
+    class FakeClient:
+        def resolve_revision(self, revset: str):
+            parents = {
+                "open-base": "trunk-commit",
+                "top-change": "merged-commit",
+            }
+            commit_ids = {
+                "open-base": "open-base-commit",
+                "top-change": "top-commit",
+            }
+            if revset not in commit_ids:
+                raise AssertionError(f"unexpected revset: {revset}")
+            return SimpleNamespace(
+                commit_id=commit_ids[revset],
+                only_parent_commit_id=lambda: parents[revset],
+            )
+
+        def rebase_revision(self, *, source: str, destination: str) -> None:
+            rebase_calls.append((source, destination))
+
+    open_base_revision = SimpleNamespace(
+        change_id="open-base",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="main"),
+                number=1,
+                state="open",
+            ),
+            state="open",
+        ),
+        subject="open base",
+    )
+    merged_revision = SimpleNamespace(
+        change_id="merged-change",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="review/open-base"),
+                number=2,
+                state="merged",
+            ),
+            state="closed",
+        ),
+        subject="merged middle",
+    )
+    top_revision = SimpleNamespace(
+        change_id="top-change",
+        local_divergent=False,
+        pull_request_lookup=SimpleNamespace(
+            pull_request=SimpleNamespace(
+                base=SimpleNamespace(ref="review/merged-middle"),
+                number=3,
+                state="open",
+            ),
+            state="open",
+        ),
+        subject="top survivor",
+    )
+    prepared_restack = PreparedRestack(
+        apply=True,
+        allow_nontrunk_rebase=True,
+        prepared_status=cast(
+            Any,
+            SimpleNamespace(
+                prepared=SimpleNamespace(
+                    client=FakeClient(),
+                    stack=SimpleNamespace(trunk=SimpleNamespace(commit_id="trunk-commit")),
+                    status_revisions=(
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="open-base",
+                                commit_id="open-base-commit",
+                                only_parent_commit_id=lambda: "trunk-commit",
+                            )
+                        ),
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="merged-change",
+                                commit_id="merged-commit",
+                                only_parent_commit_id=lambda: "open-base-commit",
+                            )
+                        ),
+                        SimpleNamespace(
+                            revision=SimpleNamespace(
+                                change_id="top-change",
+                                commit_id="top-commit",
+                                only_parent_commit_id=lambda: "merged-commit",
+                            )
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    async def fake_inspect_restack(*, prepared_restack):
+        inspect_calls.append(prepared_restack)
+        return SimpleNamespace(
+            github_error=None,
+            github_repository="octo-org/stacked-review",
+            remote=GitRemote(
+                name="origin",
+                url="git@github.com:octo-org/stacked-review.git",
+            ),
+            remote_error=None,
+            revisions=(open_base_revision, merged_revision, top_revision),
+            selected_revset="@",
+        )
+
+    monkeypatch.setattr("jj_review.commands.cleanup._inspect_restack", fake_inspect_restack)
+
+    result = stream_restack(prepared_restack=prepared_restack)
+
+    assert inspect_calls == [prepared_restack]
+    assert result.blocked is False
+    assert result.requires_nontrunk_rebase is False
+    assert rebase_calls == [("top-change", "open-base-commit")]
+    assert len(result.actions) == 2
+    assert result.actions[0].message == "rebase top-chan onto open-bas"
+    assert result.actions[0].status == "applied"
+    assert result.actions[1].message == (
+        "PR #2 merged into review branch review/open-base; configure GitHub to block "
+        "merges of PRs targeting `review/*`"
+    )
 
 
 def test_inspect_restack_pull_request_uses_cached_pull_request_before_head_lookup() -> None:
@@ -694,6 +943,7 @@ def test_inspect_restack_batches_cached_pull_request_numbers(monkeypatch) -> Non
         _inspect_restack(
             prepared_restack=PreparedRestack(
                 apply=False,
+                allow_nontrunk_rebase=False,
                 prepared_status=prepared_status,
             )
         )
@@ -821,6 +1071,7 @@ def test_inspect_restack_batches_uncached_head_refs(monkeypatch) -> None:
         _inspect_restack(
             prepared_restack=PreparedRestack(
                 apply=False,
+                allow_nontrunk_rebase=False,
                 prepared_status=prepared_status,
             )
         )
@@ -892,6 +1143,7 @@ def test_inspect_restack_blocks_when_cached_pr_batch_lookup_fails(monkeypatch) -
         _inspect_restack(
             prepared_restack=PreparedRestack(
                 apply=False,
+                allow_nontrunk_rebase=False,
                 prepared_status=prepared_status,
             )
         )
@@ -969,6 +1221,7 @@ def test_inspect_restack_blocks_when_head_ref_batch_lookup_fails(monkeypatch) ->
         _inspect_restack(
             prepared_restack=PreparedRestack(
                 apply=False,
+                allow_nontrunk_rebase=False,
                 prepared_status=prepared_status,
             )
         )

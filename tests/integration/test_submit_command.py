@@ -1448,6 +1448,71 @@ def test_cleanup_restack_previews_and_applies_survivor_rebase_after_merged_ances
     assert JjClient(repo).resolve_revision(bottom_change_id).commit_id != rewritten_top.commit_id
 
 
+def test_cleanup_restack_blocks_nontrunk_rebase_without_override(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+    _commit(repo, "feature 2", "feature-2.txt")
+    _commit(repo, "feature 3", "feature-3.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    bottom_change_id = stack.revisions[0].change_id
+    top_change_id = stack.revisions[-1].change_id
+    fake_repo.pull_requests[2].state = "closed"
+    fake_repo.pull_requests[2].merged_at = "2026-03-16T12:00:00Z"
+
+    preview_exit_code = _main(repo, config_path, "cleanup", "--restack", top_change_id)
+    preview = capsys.readouterr()
+
+    assert preview_exit_code == 1
+    assert "Planned restack actions:" in preview.out
+    assert (
+        f"rebase {top_change_id[:8]} onto {bottom_change_id[:8]} requires "
+        "--allow-nontrunk-rebase" in preview.out
+    )
+    assert "Manual follow-up: run `jj rebase`" in preview.out
+
+    apply_exit_code = _main(
+        repo,
+        config_path,
+        "cleanup",
+        "--restack",
+        "--apply",
+        top_change_id,
+    )
+    blocked_apply = capsys.readouterr()
+    unchanged_top = JjClient(repo).resolve_revision(top_change_id)
+    unchanged_bottom = JjClient(repo).resolve_revision(bottom_change_id)
+
+    assert apply_exit_code == 1
+    assert "[blocked] restack" in blocked_apply.out
+    assert unchanged_top.only_parent_commit_id() != unchanged_bottom.commit_id
+
+    forced_apply_exit_code = _main(
+        repo,
+        config_path,
+        "cleanup",
+        "--restack",
+        "--apply",
+        "--allow-nontrunk-rebase",
+        top_change_id,
+    )
+    forced_apply = capsys.readouterr()
+    rewritten_top = JjClient(repo).resolve_revision(top_change_id)
+    rewritten_bottom = JjClient(repo).resolve_revision(bottom_change_id)
+
+    assert forced_apply_exit_code == 0
+    assert "Applied restack actions:" in forced_apply.out
+    assert rewritten_top.only_parent_commit_id() == rewritten_bottom.commit_id
+
+
 def test_cleanup_reports_stale_cache_and_remote_branch_without_applying(
     tmp_path: Path,
     monkeypatch,
