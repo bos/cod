@@ -1474,6 +1474,71 @@ def test_cleanup_apply_removes_stale_cache_and_remote_branch(
     assert f"refs/heads/{bookmark}" not in _remote_refs(fake_repo.git_dir)
 
 
+def test_cleanup_apply_keeps_remote_branch_when_target_changes_mid_delete(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    repo, fake_repo = _init_repo(tmp_path)
+    config_path = _configure_submit_environment(monkeypatch, tmp_path, fake_repo)
+    _commit(repo, "feature 1", "feature-1.txt")
+
+    assert _main(repo, config_path, "submit") == 0
+    capsys.readouterr()
+
+    stack = JjClient(repo).discover_review_stack()
+    change_id = stack.revisions[-1].change_id
+    state_store = ReviewStateStore.for_repo(repo)
+    initial_state = state_store.load()
+    bookmark = initial_state.changes[change_id].bookmark
+    assert bookmark is not None
+
+    _run(["jj", "abandon", change_id], repo)
+    _run(["jj", "bookmark", "delete", bookmark], repo)
+
+    original_delete_remote_bookmark = JjClient.delete_remote_bookmark
+
+    def delete_remote_bookmark_with_race(
+        self,
+        *,
+        remote: str,
+        bookmark: str,
+        expected_remote_target: str,
+    ) -> None:
+        _run(
+            [
+                "git",
+                "--git-dir",
+                str(fake_repo.git_dir),
+                "update-ref",
+                f"refs/heads/{bookmark}",
+                _read_remote_ref(fake_repo.git_dir, "main"),
+            ],
+            fake_repo.git_dir.parent,
+        )
+        original_delete_remote_bookmark(
+            self,
+            remote=remote,
+            bookmark=bookmark,
+            expected_remote_target=expected_remote_target,
+        )
+
+    monkeypatch.setattr(
+        "jj_review.commands.cleanup.JjClient.delete_remote_bookmark",
+        delete_remote_bookmark_with_race,
+    )
+
+    exit_code = _main(repo, config_path, "cleanup", "--apply")
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert change_id in state_store.load().changes
+    assert _read_remote_ref(fake_repo.git_dir, bookmark) == _read_remote_ref(
+        fake_repo.git_dir, "main"
+    )
+    assert "force-with-lease" in captured.err
+
+
 def test_cleanup_apply_deletes_managed_stack_comment_for_closed_pull_request(
     tmp_path: Path,
     monkeypatch,

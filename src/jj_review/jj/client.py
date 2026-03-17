@@ -313,10 +313,23 @@ class JjClient:
         self.fetch_remote(remote=remote)
         self.track_bookmark(remote=remote, bookmark=bookmark)
 
-    def delete_remote_bookmark(self, *, remote: str, bookmark: str) -> None:
+    def delete_remote_bookmark(
+        self,
+        *,
+        remote: str,
+        bookmark: str,
+        expected_remote_target: str,
+    ) -> None:
         """Delete one remote bookmark by name."""
 
-        self._run_git(("push", remote, f":refs/heads/{bookmark}"))
+        self._run_git(
+            (
+                "push",
+                f"--force-with-lease=refs/heads/{bookmark}:{expected_remote_target}",
+                remote,
+                f":refs/heads/{bookmark}",
+            )
+        )
         self.fetch_remote(remote=remote)
 
     def _query_revisions(self, revset: str, *, limit: int | None = None) -> list[LocalRevision]:

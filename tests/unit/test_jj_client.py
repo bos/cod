@@ -352,6 +352,33 @@ def test_update_untracked_remote_bookmark_pushes_fetches_and_tracks() -> None:
     ]
 
 
+def test_delete_remote_bookmark_pushes_with_lease_and_fetches() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        commands.append(tuple(command))
+        assert cwd == Path("/repo")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    client = JjClient(Path("/repo"), runner=run)
+    client.delete_remote_bookmark(
+        remote="origin",
+        bookmark="review/foo",
+        expected_remote_target="old456",
+    )
+
+    assert commands == [
+        (
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/review/foo:old456",
+            "origin",
+            ":refs/heads/review/foo",
+        ),
+        ("jj", "git", "fetch", "--remote", "origin"),
+    ]
+
+
 def test_list_bookmark_states_treats_null_targets_as_deleted() -> None:
     responses: dict[tuple[str, ...], str] = {
         (

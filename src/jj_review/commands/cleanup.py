@@ -59,6 +59,14 @@ class StackCommentCleanupPlan:
     comment_id: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteBranchCleanupPlan:
+    """Planned or blocked remote-branch cleanup details."""
+
+    action: CleanupAction
+    expected_remote_target: str | None = None
+
+
 def run_cleanup(
     *,
     apply: bool,
@@ -119,7 +127,7 @@ async def _run_cleanup_async(
             if apply:
                 next_changes.pop(change_id, None)
 
-            remote_action = _plan_remote_branch_cleanup(
+            remote_plan = _plan_remote_branch_cleanup(
                 bookmark_state=bookmark_states.get(
                     cached_change.bookmark or "",
                     BookmarkState(name=cached_change.bookmark or ""),
@@ -127,16 +135,22 @@ async def _run_cleanup_async(
                 cached_change=cached_change,
                 remote=remote,
             )
-            if remote_action is not None:
-                actions.append(remote_action)
-                if apply and remote_action.status == "planned" and remote is not None:
+            if remote_plan is not None:
+                actions.append(remote_plan.action)
+                if (
+                    apply
+                    and remote_plan.action.status == "planned"
+                    and remote is not None
+                    and remote_plan.expected_remote_target is not None
+                ):
                     jj_client.delete_remote_bookmark(
                         remote=remote.name,
                         bookmark=cached_change.bookmark or "",
+                        expected_remote_target=remote_plan.expected_remote_target,
                     )
                     actions[-1] = CleanupAction(
-                        kind=remote_action.kind,
-                        message=remote_action.message,
+                        kind=remote_plan.action.kind,
+                        message=remote_plan.action.message,
                         status="applied",
                     )
 
@@ -171,7 +185,7 @@ async def _run_cleanup_async(
                 if apply:
                     next_changes.pop(change_id, None)
 
-                remote_action = _plan_remote_branch_cleanup(
+                remote_plan = _plan_remote_branch_cleanup(
                     bookmark_state=bookmark_states.get(
                         cached_change.bookmark or "",
                         BookmarkState(name=cached_change.bookmark or ""),
@@ -179,16 +193,22 @@ async def _run_cleanup_async(
                     cached_change=cached_change,
                     remote=remote,
                 )
-                if remote_action is not None:
-                    actions.append(remote_action)
-                    if apply and remote_action.status == "planned" and remote is not None:
+                if remote_plan is not None:
+                    actions.append(remote_plan.action)
+                    if (
+                        apply
+                        and remote_plan.action.status == "planned"
+                        and remote is not None
+                        and remote_plan.expected_remote_target is not None
+                    ):
                         jj_client.delete_remote_bookmark(
                             remote=remote.name,
                             bookmark=cached_change.bookmark or "",
+                            expected_remote_target=remote_plan.expected_remote_target,
                         )
                         actions[-1] = CleanupAction(
-                            kind=remote_action.kind,
-                            message=remote_action.message,
+                            kind=remote_plan.action.kind,
+                            message=remote_plan.action.message,
                             status="applied",
                         )
 
@@ -319,7 +339,7 @@ def _plan_remote_branch_cleanup(
     bookmark_state: BookmarkState,
     cached_change: CachedChange,
     remote: GitRemote | None,
-) -> CleanupAction | None:
+) -> RemoteBranchCleanupPlan | None:
     bookmark = cached_change.bookmark
     if remote is None or bookmark is None or not bookmark.startswith("review/"):
         return None
@@ -330,28 +350,35 @@ def _plan_remote_branch_cleanup(
 
     branch_label = f"{bookmark}@{remote.name}"
     if bookmark_state.local_targets:
-        return CleanupAction(
-            kind="remote branch",
-            message=(
-                f"cannot delete remote review branch {branch_label} while the "
-                f"local bookmark {bookmark!r} still exists"
+        return RemoteBranchCleanupPlan(
+            action=CleanupAction(
+                kind="remote branch",
+                message=(
+                    f"cannot delete remote review branch {branch_label} while the "
+                    f"local bookmark {bookmark!r} still exists"
+                ),
+                status="blocked",
             ),
-            status="blocked",
         )
     if len(remote_state.targets) > 1:
-        return CleanupAction(
-            kind="remote branch",
-            message=(
-                f"cannot delete remote review branch {branch_label} because the "
-                "remote bookmark is conflicted"
+        return RemoteBranchCleanupPlan(
+            action=CleanupAction(
+                kind="remote branch",
+                message=(
+                    f"cannot delete remote review branch {branch_label} because the "
+                    "remote bookmark is conflicted"
+                ),
+                status="blocked",
             ),
-            status="blocked",
         )
 
-    return CleanupAction(
-        kind="remote branch",
-        message=f"delete remote review branch {branch_label}",
-        status="planned",
+    return RemoteBranchCleanupPlan(
+        action=CleanupAction(
+            kind="remote branch",
+            message=f"delete remote review branch {branch_label}",
+            status="planned",
+        ),
+        expected_remote_target=remote_state.target,
     )
 
 
