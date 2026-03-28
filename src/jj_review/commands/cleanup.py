@@ -11,9 +11,9 @@ from typing import Literal
 from jj_review.cache import ReviewStateStore
 from jj_review.commands.review_state import (
     PreparedStatus,
+    PullRequestLookup,
     ReviewStatusRevision,
     prepare_status,
-    stream_status,
 )
 from jj_review.commands.submit import (
     _STACK_COMMENT_MARKER,
@@ -124,6 +124,16 @@ class PreparedRestack:
     prepared_status: PreparedStatus
 
 
+@dataclass(frozen=True, slots=True)
+class _RestackInspection:
+    github_error: str | None
+    github_repository: str | None
+    remote: GitRemote | None
+    remote_error: str | None
+    revisions: tuple[ReviewStatusRevision, ...]
+    selected_revset: str
+
+
 def run_cleanup(
     *,
     apply: bool,
@@ -220,24 +230,398 @@ def stream_restack(
 ) -> RestackResult:
     """Inspect and optionally apply a local restack plan for merged path changes."""
 
-    status_result = stream_status(prepared_status=prepared_restack.prepared_status)
+    inspection = asyncio.run(_inspect_restack(prepared_restack=prepared_restack))
     return _build_restack_result(
+        inspection=inspection,
         on_action=on_action,
         prepared_restack=prepared_restack,
-        status_result=status_result,
+    )
+
+
+async def _inspect_restack(
+    *,
+    prepared_restack: PreparedRestack,
+) -> _RestackInspection:
+    prepared_status = prepared_restack.prepared_status
+    prepared = prepared_status.prepared
+    selected_revset = prepared_status.selected_revset
+    github_repository = prepared_status.github_repository
+    github_repository_error = prepared_status.github_repository_error
+
+    if prepared.remote is None:
+        return _RestackInspection(
+            github_error=None,
+            github_repository=None,
+            remote=None,
+            remote_error=prepared.remote_error,
+            revisions=(),
+            selected_revset=selected_revset,
+        )
+    if github_repository is None:
+        return _RestackInspection(
+            github_error=github_repository_error,
+            github_repository=None,
+            remote=prepared.remote,
+            remote_error=None,
+            revisions=(),
+            selected_revset=selected_revset,
+        )
+    if not prepared.status_revisions:
+        return _RestackInspection(
+            github_error=None,
+            github_repository=github_repository.full_name,
+            remote=prepared.remote,
+            remote_error=None,
+            revisions=(),
+            selected_revset=selected_revset,
+        )
+
+    async with _build_github_client(base_url=github_repository.api_base_url) as github_client:
+        revisions = await _inspect_restack_revisions(
+            github_client=github_client,
+            github_repository=github_repository,
+            prepared_status=prepared_status,
+        )
+
+    github_error = next(
+        (
+            lookup.repository_error
+            for revision in revisions
+            if revision.pull_request_lookup is not None
+            and (lookup := revision.pull_request_lookup).repository_error is not None
+        ),
+        None,
+    )
+    return _RestackInspection(
+        github_error=github_error,
+        github_repository=github_repository.full_name,
+        remote=prepared.remote,
+        remote_error=None,
+        revisions=tuple(revisions),
+        selected_revset=selected_revset,
+    )
+
+
+async def _inspect_restack_revisions(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    prepared_status: PreparedStatus,
+) -> list[ReviewStatusRevision]:
+    prepared_revisions = prepared_status.prepared.status_revisions
+    cached_pull_requests = await _load_cached_pull_requests_for_restack(
+        github_client=github_client,
+        github_repository=github_repository,
+        prepared_revisions=prepared_revisions,
+    )
+    pull_requests_by_head_ref = await _load_pull_requests_by_head_refs_for_restack(
+        cached_pull_requests=cached_pull_requests,
+        github_client=github_client,
+        github_repository=github_repository,
+        prepared_revisions=prepared_revisions,
+    )
+    semaphore = asyncio.Semaphore(_GITHUB_INSPECTION_CONCURRENCY)
+    tasks = [
+        asyncio.create_task(
+            _inspect_restack_revision(
+                cached_pull_requests=cached_pull_requests,
+                github_client=github_client,
+                github_repository=github_repository,
+                prepared_revision=prepared_revision,
+                pull_requests_by_head_ref=pull_requests_by_head_ref,
+                semaphore=semaphore,
+            )
+        )
+        for prepared_revision in prepared_revisions
+    ]
+    return list(await asyncio.gather(*tasks))
+
+
+async def _load_cached_pull_requests_for_restack(
+    *,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    prepared_revisions,
+) -> dict[int, GithubPullRequest | None]:
+    pull_numbers = sorted(
+        {
+            prepared_revision.cached_change.pr_number
+            for prepared_revision in prepared_revisions
+            if prepared_revision.cached_change is not None
+            and prepared_revision.cached_change.pr_number is not None
+        }
+    )
+    if not pull_numbers:
+        return {}
+    try:
+        return await github_client.get_pull_requests_by_numbers(
+            github_repository.owner,
+            github_repository.repo,
+            pull_numbers=pull_numbers,
+        )
+    except GithubClientError as error:
+        if error.status_code not in {404, 405, 501}:
+            raise
+        return {}
+
+
+async def _load_pull_requests_by_head_refs_for_restack(
+    *,
+    cached_pull_requests: dict[int, GithubPullRequest | None],
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    prepared_revisions,
+) -> dict[str, tuple[GithubPullRequest, ...]]:
+    head_refs = sorted(
+        {
+            prepared_revision.bookmark
+            for prepared_revision in prepared_revisions
+            if not _cached_pull_request_matches_revision(
+                prepared_revision=prepared_revision,
+                cached_pull_requests=cached_pull_requests,
+            )
+        }
+    )
+    if not head_refs:
+        return {}
+    try:
+        return await github_client.get_pull_requests_by_head_refs(
+            github_repository.owner,
+            github_repository.repo,
+            head_refs=head_refs,
+        )
+    except GithubClientError as error:
+        if error.status_code not in {404, 405, 501}:
+            raise
+        return {}
+
+
+def _cached_pull_request_matches_revision(
+    *,
+    prepared_revision,
+    cached_pull_requests: dict[int, GithubPullRequest | None],
+) -> bool:
+    cached_change = prepared_revision.cached_change
+    if cached_change is None or cached_change.pr_number is None:
+        return False
+    cached_pull_request = cached_pull_requests.get(cached_change.pr_number)
+    return (
+        cached_pull_request is not None
+        and cached_pull_request.head.ref == prepared_revision.bookmark
+    )
+
+
+async def _inspect_restack_revision(
+    *,
+    cached_pull_requests: dict[int, GithubPullRequest | None],
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    prepared_revision,
+    pull_requests_by_head_ref: dict[str, tuple[GithubPullRequest, ...]],
+    semaphore: asyncio.Semaphore,
+) -> ReviewStatusRevision:
+    async with semaphore:
+        pull_request_lookup = await _inspect_restack_pull_request(
+            bookmark=prepared_revision.bookmark,
+            cached_change=prepared_revision.cached_change,
+            cached_pull_requests=cached_pull_requests,
+            github_client=github_client,
+            github_repository=github_repository,
+            pull_requests_by_head_ref=pull_requests_by_head_ref,
+        )
+        return ReviewStatusRevision(
+            bookmark=prepared_revision.bookmark,
+            bookmark_source=prepared_revision.bookmark_source,
+            cached_change=prepared_revision.cached_change,
+            change_id=prepared_revision.revision.change_id,
+            local_divergent=getattr(prepared_revision.revision, "divergent", False),
+            pull_request_lookup=pull_request_lookup,
+            remote_state=None,
+            stack_comment_lookup=None,
+            subject=prepared_revision.revision.subject,
+        )
+
+
+async def _inspect_restack_pull_request(
+    *,
+    bookmark: str,
+    cached_change: CachedChange | None,
+    cached_pull_requests: dict[int, GithubPullRequest | None],
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+    pull_requests_by_head_ref: dict[str, tuple[GithubPullRequest, ...]],
+) -> PullRequestLookup:
+    cached_pr_number = cached_change.pr_number if cached_change is not None else None
+    if cached_pr_number is not None:
+        cached_pull_request = cached_pull_requests.get(cached_pr_number)
+        if cached_pull_request is not None and cached_pull_request.head.ref == bookmark:
+            return _restack_lookup_from_pull_request(
+                _normalize_restack_pull_request(cached_pull_request)
+            )
+
+    pull_requests = pull_requests_by_head_ref.get(bookmark)
+    if pull_requests is not None:
+        return _restack_lookup_from_head_pull_requests(
+            bookmark=bookmark,
+            pull_requests=pull_requests,
+        )
+
+    return await _inspect_restack_pull_request_by_head(
+        bookmark=bookmark,
+        github_client=github_client,
+        github_repository=github_repository,
+    )
+
+
+async def _inspect_restack_pull_request_by_head(
+    *,
+    bookmark: str,
+    github_client: GithubClient,
+    github_repository: ResolvedGithubRepository,
+) -> PullRequestLookup:
+    head_label = f"{github_repository.owner}:{bookmark}"
+    try:
+        pull_requests = await github_client.list_pull_requests(
+            github_repository.owner,
+            github_repository.repo,
+            head=head_label,
+        )
+    except GithubClientError as error:
+        return _restack_lookup_from_error(action="pull request lookup", error=error)
+
+    if not pull_requests:
+        return PullRequestLookup(
+            message=None,
+            pull_request=None,
+            repository_error=None,
+            state="missing",
+        )
+    if len(pull_requests) > 1:
+        numbers = ", ".join(str(pull_request.number) for pull_request in pull_requests)
+        return PullRequestLookup(
+            message=(
+                f"GitHub reports multiple pull requests for head branch {head_label!r}: "
+                f"{numbers}."
+            ),
+            pull_request=None,
+            repository_error=None,
+            state="ambiguous",
+        )
+    return _restack_lookup_from_pull_request(_normalize_restack_pull_request(pull_requests[0]))
+
+
+def _restack_lookup_from_pull_request(pull_request: GithubPullRequest) -> PullRequestLookup:
+    if pull_request.state != "open":
+        return PullRequestLookup(
+            message=(
+                f"GitHub reports pull request #{pull_request.number} for head branch "
+                f"{pull_request.head.ref!r} in state {pull_request.state!r}."
+            ),
+            pull_request=pull_request,
+            review_decision=None,
+            repository_error=None,
+            state="closed",
+        )
+    return PullRequestLookup(
+        message=None,
+        pull_request=pull_request,
+        review_decision=None,
+        review_decision_error=None,
+        repository_error=None,
+        state="open",
+    )
+
+
+def _restack_lookup_from_head_pull_requests(
+    *,
+    bookmark: str,
+    pull_requests: tuple[GithubPullRequest, ...],
+) -> PullRequestLookup:
+    head_label = bookmark
+    if not pull_requests:
+        return PullRequestLookup(
+            message=None,
+            pull_request=None,
+            repository_error=None,
+            state="missing",
+        )
+    if len(pull_requests) > 1:
+        numbers = ", ".join(str(pull_request.number) for pull_request in pull_requests)
+        return PullRequestLookup(
+            message=(
+                f"GitHub reports multiple pull requests for head branch {head_label!r}: "
+                f"{numbers}."
+            ),
+            pull_request=None,
+            repository_error=None,
+            state="ambiguous",
+        )
+    return _restack_lookup_from_pull_request(
+        _normalize_restack_pull_request(pull_requests[0])
+    )
+
+
+def _restack_lookup_from_error(*, action: str, error: GithubClientError) -> PullRequestLookup:
+    return PullRequestLookup(
+        message=_summarize_restack_lookup_error(action=action, error=error),
+        pull_request=None,
+        repository_error=(
+            _summarize_restack_repository_error(error)
+            if _is_repository_level_restack_error(error)
+            else None
+        ),
+        state="error",
+    )
+
+
+def _normalize_restack_pull_request(pull_request: GithubPullRequest) -> GithubPullRequest:
+    if pull_request.state != "closed" or pull_request.merged_at is None:
+        return pull_request
+    return pull_request.model_copy(update={"state": "merged"})
+
+
+def _summarize_restack_lookup_error(*, action: str, error: GithubClientError) -> str:
+    if error.status_code is None:
+        return "GitHub is unavailable - check network connectivity"
+    if error.status_code == 401:
+        return "GitHub authentication failed - check GITHUB_TOKEN"
+    if error.status_code == 403:
+        return "GitHub access was denied - check GITHUB_TOKEN and repo access"
+    if error.status_code >= 500:
+        return "GitHub is unavailable - check network connectivity"
+    return f"{action} failed (GitHub {error.status_code})"
+
+
+def _summarize_restack_repository_error(error: GithubClientError) -> str:
+    if error.status_code is None:
+        return "unavailable - check network connectivity"
+    if error.status_code == 401:
+        return "auth failed - check GITHUB_TOKEN"
+    if error.status_code == 403:
+        return "access denied - check GITHUB_TOKEN and repo access"
+    if error.status_code == 404:
+        return "repo not found or inaccessible - check GITHUB_TOKEN and repo access"
+    if error.status_code >= 500:
+        return "unavailable - check network connectivity"
+    return f"unavailable (GitHub {error.status_code})"
+
+
+def _is_repository_level_restack_error(error: GithubClientError) -> bool:
+    return error.status_code in {401, 403, 404} or error.status_code is None or (
+        error.status_code is not None and error.status_code >= 500
     )
 
 
 def _build_restack_result(
     *,
+    inspection: _RestackInspection,
     on_action: Callable[[CleanupAction], None] | None,
     prepared_restack: PreparedRestack,
-    status_result,
 ) -> RestackResult:
     prepared_status = prepared_restack.prepared_status
     prepared = prepared_status.prepared
     revisions_by_change_id = {
-        revision.change_id: revision for revision in status_result.revisions
+        revision.change_id: revision for revision in inspection.revisions
     }
     path_revisions = tuple(
         revisions_by_change_id[prepared_revision.revision.change_id]
@@ -252,7 +636,7 @@ def _build_restack_result(
         if on_action is not None:
             on_action(action)
 
-    if status_result.github_error is not None or status_result.github_repository is None:
+    if inspection.github_error is not None or inspection.github_repository is None:
         record_action(
             CleanupAction(
                 kind="restack",
@@ -267,11 +651,11 @@ def _build_restack_result(
             actions=tuple(actions),
             applied=prepared_restack.apply,
             blocked=True,
-            github_error=status_result.github_error,
-            github_repository=status_result.github_repository,
-            remote=status_result.remote,
-            remote_error=status_result.remote_error,
-            selected_revset=status_result.selected_revset,
+            github_error=inspection.github_error,
+            github_repository=inspection.github_repository,
+            remote=inspection.remote,
+            remote_error=inspection.remote_error,
+            selected_revset=inspection.selected_revset,
         )
 
     blocked = False
@@ -283,11 +667,11 @@ def _build_restack_result(
             actions=(),
             applied=prepared_restack.apply,
             blocked=False,
-            github_error=status_result.github_error,
-            github_repository=status_result.github_repository,
-            remote=status_result.remote,
-            remote_error=status_result.remote_error,
-            selected_revset=status_result.selected_revset,
+            github_error=inspection.github_error,
+            github_repository=inspection.github_repository,
+            remote=inspection.remote,
+            remote_error=inspection.remote_error,
+            selected_revset=inspection.selected_revset,
         )
 
     closed_unmerged_revisions = tuple(
@@ -421,11 +805,11 @@ def _build_restack_result(
         actions=tuple(actions),
         applied=prepared_restack.apply,
         blocked=blocked,
-        github_error=status_result.github_error,
-        github_repository=status_result.github_repository,
-        remote=status_result.remote,
-        remote_error=status_result.remote_error,
-        selected_revset=status_result.selected_revset,
+        github_error=inspection.github_error,
+        github_repository=inspection.github_repository,
+        remote=inspection.remote,
+        remote_error=inspection.remote_error,
+        selected_revset=inspection.selected_revset,
     )
 
 

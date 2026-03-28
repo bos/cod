@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -237,3 +238,127 @@ def test_github_client_paginates_pull_request_list() -> None:
         return pull_requests[0].number, pull_requests[1].number
 
     assert asyncio.run(run_test()) == (1, 2)
+
+
+def test_github_client_batches_pull_request_lookup_by_number_with_graphql() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/graphql"
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["variables"] == {"owner": "octo-org", "repo": "stacked-review"}
+        assert "pr_7: pullRequest(number: 7)" in payload["query"]
+        assert "pr_9: pullRequest(number: 9)" in payload["query"]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "pr_7": {
+                            "baseRefName": "main",
+                            "body": "body 7",
+                            "headRefName": "review/seven",
+                            "mergedAt": None,
+                            "number": 7,
+                            "state": "OPEN",
+                            "title": "seven",
+                            "url": "https://github.test/octo-org/stacked-review/pull/7",
+                        },
+                        "pr_9": {
+                            "baseRefName": "review/base",
+                            "body": None,
+                            "headRefName": "review/nine",
+                            "mergedAt": "2026-03-16T12:00:00Z",
+                            "number": 9,
+                            "state": "CLOSED",
+                            "title": "nine",
+                            "url": "https://github.test/octo-org/stacked-review/pull/9",
+                        },
+                    }
+                }
+            },
+            request=request,
+        )
+
+    async def run_test() -> tuple[str, str]:
+        transport = httpx.MockTransport(handler)
+        async with GithubClient(
+            base_url="https://api.github.test",
+            transport=transport,
+        ) as client:
+            pull_requests = await client.get_pull_requests_by_numbers(
+                "octo-org",
+                "stacked-review",
+                pull_numbers=(7, 9),
+            )
+        pull_request_7 = pull_requests[7]
+        pull_request_9 = pull_requests[9]
+        if pull_request_7 is None or pull_request_9 is None:
+            raise AssertionError("GraphQL lookup should return both pull requests.")
+        return pull_request_7.head.ref, pull_request_9.state
+
+    assert asyncio.run(run_test()) == ("review/seven", "closed")
+
+
+def test_github_client_batches_pull_request_lookup_by_head_ref_with_graphql() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/graphql"
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["variables"] == {"owner": "octo-org", "repo": "stacked-review"}
+        assert 'headRefName: "review/seven"' in payload["query"]
+        assert 'headRefName: "review/nine"' in payload["query"]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "repository": {
+                        "head_0": {
+                            "nodes": [
+                                {
+                                    "baseRefName": "review/base",
+                                    "body": None,
+                                    "headRefName": "review/nine",
+                                    "mergedAt": "2026-03-16T12:00:00Z",
+                                    "number": 9,
+                                    "state": "CLOSED",
+                                    "title": "nine",
+                                    "url": "https://github.test/octo-org/stacked-review/"
+                                    "pull/9",
+                                }
+                            ]
+                        },
+                        "head_1": {
+                            "nodes": [
+                                {
+                                    "baseRefName": "main",
+                                    "body": "body 7",
+                                    "headRefName": "review/seven",
+                                    "mergedAt": None,
+                                    "number": 7,
+                                    "state": "OPEN",
+                                    "title": "seven",
+                                    "url": "https://github.test/octo-org/stacked-review/"
+                                    "pull/7",
+                                }
+                            ]
+                        },
+                    }
+                }
+            },
+            request=request,
+        )
+
+    async def run_test() -> tuple[str, str]:
+        transport = httpx.MockTransport(handler)
+        async with GithubClient(
+            base_url="https://api.github.test",
+            transport=transport,
+        ) as client:
+            pull_requests = await client.get_pull_requests_by_head_refs(
+                "octo-org",
+                "stacked-review",
+                head_refs=("review/seven", "review/nine"),
+            )
+        pull_request_7 = pull_requests["review/seven"][0]
+        pull_request_9 = pull_requests["review/nine"][0]
+        return pull_request_7.head.ref, pull_request_9.state
+
+    assert asyncio.run(run_test()) == ("review/seven", "closed")
