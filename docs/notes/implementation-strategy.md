@@ -741,8 +741,11 @@ Deliver:
   problem instead of presenting them as a mysterious stack failure
 - add `cleanup --restack` as the explicit opt-in local rewrite path for merged
   ancestors
-- restack surviving descendants onto the nearest surviving local review base,
-  using the selected local path rather than fetched branch-tip commits for
+- let default `cleanup --restack --apply` perform only survivor rebases whose
+  destination is `trunk()`
+- require `--allow-nontrunk-rebase` or manual `jj rebase` before restacking
+  surviving descendants onto another surviving local review base
+- keep using the selected local path rather than fetched branch-tip commits for
   merged non-trunk PRs
 - leave merged or off-path artifacts alone unless some later cleanup pass can
   prove they are stale and removable
@@ -755,7 +758,8 @@ Done when:
 - the default status output tells the operator what `cleanup needed` means and
   what command to run next instead of making them infer the repair flow
 - `cleanup --restack` restores one linear local stack of surviving review
-  units by excising merged path changes from active local ancestry
+  units by excising merged path changes from active local ancestry, while
+  blocking non-trunk survivor rebases unless the operator opts in explicitly
 - fetched branch-tip commits for merged non-trunk PRs are treated as projected
   remote state, not as the canonical continuation of the local stack
 - automatic local rewrites fail closed only when the selected path or PR

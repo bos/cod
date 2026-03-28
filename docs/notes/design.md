@@ -566,7 +566,11 @@ contains merged review units.
 Its UX should be explicit:
 
 - without `--apply`, it previews the local restack plan
-- with `--apply`, it performs the local rewrite
+- with `--apply`, it performs only the restack steps whose destination is
+  `trunk()`
+- if a remaining restack step would rebase onto another surviving review unit,
+  it should stop and tell the user to either rebase manually with `jj rebase`
+  or rerun with `--allow-nontrunk-rebase`
 - if repo policy is part of the problem, it should say so directly instead of
   making the user reverse-engineer it from the DAG
 
@@ -596,13 +600,16 @@ The algorithm should be:
    - the nearest earlier survivor on the selected path, if any
    - otherwise the current `trunk()`
 5. Rebase each survivor segment whose current parent is a merged path change
-   onto that desired new parent. This restores one linear local stack of the
-   surviving review units and any unsubmitted descendants above them.
-6. After the rebases succeed, the implementation may leave merged or fetched
+   onto that desired new parent, but allow default `--apply` to perform only
+   the steps whose destination is `trunk()`
+6. If later survivor segments would still need to land on another surviving
+   review unit, stop and require either manual `jj rebase` or an explicit
+   `--allow-nontrunk-rebase` override
+7. After the rebases succeed, the implementation may leave merged or fetched
    off-path artifacts in place until a later conservative cleanup pass can
    prove they are stale and removable. Restack's primary job is to repair the
    active local path first.
-7. Do not rebase surviving local descendants onto fetched branch-tip commits
+8. Do not rebase surviving local descendants onto fetched branch-tip commits
    for merged non-trunk PRs. Those fetched commits are projected branch state,
    not the canonical continuation of the active local stack.
 

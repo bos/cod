@@ -113,6 +113,7 @@ class RestackResult:
     github_repository: str | None
     remote: GitRemote | None
     remote_error: str | None
+    requires_nontrunk_rebase: bool
     selected_revset: str
 
 
@@ -121,6 +122,7 @@ class PreparedRestack:
     """Locally prepared restack inputs before any rewrite."""
 
     apply: bool
+    allow_nontrunk_rebase: bool
     prepared_status: PreparedStatus
 
 
@@ -189,6 +191,7 @@ def prepare_cleanup(
 def prepare_restack(
     *,
     apply: bool,
+    allow_nontrunk_rebase: bool,
     change_overrides: dict[str, ChangeConfig],
     config: RepoConfig,
     repo_root: Path,
@@ -198,6 +201,7 @@ def prepare_restack(
 
     return PreparedRestack(
         apply=apply,
+        allow_nontrunk_rebase=allow_nontrunk_rebase,
         prepared_status=prepare_status(
             change_overrides=change_overrides,
             config=config,
@@ -669,10 +673,12 @@ def _build_restack_result(
             github_repository=inspection.github_repository,
             remote=inspection.remote,
             remote_error=inspection.remote_error,
+            requires_nontrunk_rebase=False,
             selected_revset=inspection.selected_revset,
         )
 
-    blocked = False
+    hard_blocked = False
+    requires_nontrunk_rebase = False
     merged_revisions = tuple(
         revision for revision in path_revisions if _revision_has_merged_pull_request(revision)
     )
@@ -685,6 +691,7 @@ def _build_restack_result(
             github_repository=inspection.github_repository,
             remote=inspection.remote,
             remote_error=inspection.remote_error,
+            requires_nontrunk_rebase=False,
             selected_revset=inspection.selected_revset,
         )
 
@@ -692,7 +699,7 @@ def _build_restack_result(
         revision for revision in path_revisions if _revision_is_closed_unmerged(revision)
     )
     for revision in closed_unmerged_revisions:
-        blocked = True
+        hard_blocked = True
         record_action(
             CleanupAction(
                 kind="restack",
@@ -716,7 +723,7 @@ def _build_restack_result(
         if _revision_is_closed_unmerged(revision):
             continue
         if revision.local_divergent:
-            blocked = True
+            hard_blocked = True
             record_action(
                 CleanupAction(
                     kind="restack",
@@ -744,13 +751,15 @@ def _build_restack_result(
         survivor_change_ids.append(revision.change_id)
 
     client = prepared.client
-    if prepared_restack.apply and not blocked:
-        for source_change_id, destination_change_id in rebase_plans:
+    if prepared_restack.apply and not hard_blocked:
+        trunk_rebase_plans = tuple(
+            (source_change_id, destination_change_id)
+            for source_change_id, destination_change_id in rebase_plans
+            if destination_change_id is None
+        )
+        for source_change_id, destination_change_id in trunk_rebase_plans:
             source_revision = client.resolve_revision(source_change_id)
-            if destination_change_id is None:
-                destination_revision = prepared.stack.trunk.commit_id
-            else:
-                destination_revision = client.resolve_revision(destination_change_id).commit_id
+            destination_revision = prepared.stack.trunk.commit_id
             if source_revision.only_parent_commit_id() == destination_revision:
                 continue
             client.rebase_revision(
@@ -767,15 +776,61 @@ def _build_restack_result(
                     status="applied",
                 )
             )
+
+        remaining_nontrunk_rebase_plans = _remaining_nontrunk_rebase_plans(
+            client=client,
+            rebase_plans=rebase_plans,
+        )
+        if remaining_nontrunk_rebase_plans and not prepared_restack.allow_nontrunk_rebase:
+            requires_nontrunk_rebase = True
+            for source_change_id, destination_change_id in remaining_nontrunk_rebase_plans:
+                record_action(
+                    CleanupAction(
+                        kind="restack",
+                        message=_blocked_nontrunk_restack_message(
+                            source_change_id=source_change_id,
+                            destination_change_id=destination_change_id,
+                        ),
+                        status="blocked",
+                    )
+                )
+        else:
+            for source_change_id, destination_change_id in remaining_nontrunk_rebase_plans:
+                destination_revision = client.resolve_revision(destination_change_id).commit_id
+                client.rebase_revision(
+                    source=source_change_id,
+                    destination=destination_revision,
+                )
+                record_action(
+                    CleanupAction(
+                        kind="restack",
+                        message=(
+                            f"rebase {_short_change_id(source_change_id)} onto "
+                            f"{_restack_destination_label(destination_change_id)}"
+                        ),
+                        status="applied",
+                    )
+                )
     else:
         for source_change_id, destination_change_id in rebase_plans:
-            status = "blocked" if blocked else "planned"
-            message = (
-                f"rebase {_short_change_id(source_change_id)} onto "
-                f"{_restack_destination_label(destination_change_id)}"
+            message = _planned_restack_message(
+                source_change_id=source_change_id,
+                destination_change_id=destination_change_id,
             )
-            if blocked and closed_unmerged_revisions:
+            status: CleanupActionStatus = "planned"
+            if hard_blocked:
+                status = "blocked"
                 message = f"{message} once blocked path changes are resolved"
+            elif (
+                destination_change_id is not None
+                and not prepared_restack.allow_nontrunk_rebase
+            ):
+                status = "blocked"
+                requires_nontrunk_rebase = True
+                message = _blocked_nontrunk_restack_message(
+                    source_change_id=source_change_id,
+                    destination_change_id=destination_change_id,
+                )
             record_action(
                 CleanupAction(
                     kind="restack",
@@ -818,12 +873,53 @@ def _build_restack_result(
     return RestackResult(
         actions=tuple(actions),
         applied=prepared_restack.apply,
-        blocked=blocked,
+        blocked=hard_blocked or requires_nontrunk_rebase,
         github_error=inspection.github_error,
         github_repository=inspection.github_repository,
         remote=inspection.remote,
         remote_error=inspection.remote_error,
+        requires_nontrunk_rebase=requires_nontrunk_rebase,
         selected_revset=inspection.selected_revset,
+    )
+
+
+def _remaining_nontrunk_rebase_plans(
+    *,
+    client: JjClient,
+    rebase_plans: list[tuple[str, str | None]],
+) -> tuple[tuple[str, str], ...]:
+    remaining_plans: list[tuple[str, str]] = []
+    for source_change_id, destination_change_id in rebase_plans:
+        if destination_change_id is None:
+            continue
+        source_revision = client.resolve_revision(source_change_id)
+        destination_revision = client.resolve_revision(destination_change_id).commit_id
+        if source_revision.only_parent_commit_id() == destination_revision:
+            continue
+        remaining_plans.append((source_change_id, destination_change_id))
+    return tuple(remaining_plans)
+
+
+def _planned_restack_message(
+    *,
+    source_change_id: str,
+    destination_change_id: str | None,
+) -> str:
+    return (
+        f"rebase {_short_change_id(source_change_id)} onto "
+        f"{_restack_destination_label(destination_change_id)}"
+    )
+
+
+def _blocked_nontrunk_restack_message(
+    *,
+    source_change_id: str,
+    destination_change_id: str,
+) -> str:
+    return (
+        f"rebase {_short_change_id(source_change_id)} onto "
+        f"{_restack_destination_label(destination_change_id)} requires "
+        "--allow-nontrunk-rebase"
     )
 
 
