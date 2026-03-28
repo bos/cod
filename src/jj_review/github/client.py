@@ -193,9 +193,11 @@ class GithubClient:
                 )
             for alias, head_ref in aliases.items():
                 connection = repository.get(alias)
+                expected_head_label = f"{owner}:{head_ref}"
                 results[head_ref] = _pull_request_connection_from_graphql(
                     alias=alias,
                     connection=connection,
+                    expected_head_label=expected_head_label,
                     response_name="pull request head lookup",
                 )
         return results
@@ -361,9 +363,7 @@ class GithubClient:
             )
             payload = self._expect_success(response)
             if not isinstance(payload, list):
-                raise GithubClientError(
-                    f"GitHub {response_name} response was not a JSON array."
-                )
+                raise GithubClientError(f"GitHub {response_name} response was not a JSON array.")
             items.extend(payload)
             next_path = response.links.get("next", {}).get("url")
             next_params = None
@@ -387,17 +387,13 @@ class GithubClient:
         )
         payload = self._expect_success(response)
         if not isinstance(payload, dict):
-            raise GithubClientError(
-                f"GitHub {response_name} response was not a JSON object."
-            )
+            raise GithubClientError(f"GitHub {response_name} response was not a JSON object.")
         errors = payload.get("errors")
         if errors:
             raise GithubClientError(f"GitHub {response_name} failed: {errors}")
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise GithubClientError(
-                f"GitHub {response_name} response was missing `data`."
-            )
+            raise GithubClientError(f"GitHub {response_name} response was missing `data`.")
         return data
 
     def _expect_success(self, response: httpx.Response) -> Any:
@@ -511,6 +507,9 @@ def _pull_requests_by_number_query(numbers: Sequence[int]) -> str:
             "        body\n"
             "        baseRefName\n"
             "        headRefName\n"
+            "        headRepositoryOwner {\n"
+            "          login\n"
+            "        }\n"
             "      }"
         )
         for number in numbers
@@ -528,7 +527,7 @@ def _pull_requests_by_head_ref_query(aliases: dict[str, str]) -> str:
     selections = "\n".join(
         (
             f"    {alias}: pullRequests("
-            f'first: 2, states: [OPEN, CLOSED], headRefName: {json.dumps(head_ref)}) {{\n'
+            f"first: 2, states: [OPEN, CLOSED], headRefName: {json.dumps(head_ref)}) {{\n"
             "      nodes {\n"
             "        number\n"
             "        state\n"
@@ -538,6 +537,9 @@ def _pull_requests_by_head_ref_query(aliases: dict[str, str]) -> str:
             "        body\n"
             "        baseRefName\n"
             "        headRefName\n"
+            "        headRepositoryOwner {\n"
+            "          login\n"
+            "        }\n"
             "      }\n"
             "    }"
         )
@@ -553,10 +555,15 @@ def _pull_requests_by_head_ref_query(aliases: dict[str, str]) -> str:
 
 
 def _pull_request_payload_from_graphql(raw_pull_request: dict[str, object]) -> dict[str, object]:
+    head_ref = raw_pull_request.get("headRefName")
+    head_owner = _head_repository_owner_login_from_graphql(raw_pull_request)
     return {
         "base": {"ref": raw_pull_request.get("baseRefName")},
         "body": raw_pull_request.get("body"),
-        "head": {"ref": raw_pull_request.get("headRefName")},
+        "head": {
+            "label": _head_label(head_owner=head_owner, head_ref=head_ref),
+            "ref": head_ref,
+        },
         "html_url": raw_pull_request.get("url"),
         "merged_at": raw_pull_request.get("mergedAt"),
         "number": raw_pull_request.get("number"),
@@ -565,10 +572,35 @@ def _pull_request_payload_from_graphql(raw_pull_request: dict[str, object]) -> d
     }
 
 
+def _head_repository_owner_login_from_graphql(raw_pull_request: dict[str, object]) -> str | None:
+    raw_owner = raw_pull_request.get("headRepositoryOwner")
+    if raw_owner is None:
+        return None
+    if not isinstance(raw_owner, dict):
+        raise GithubClientError(
+            "GitHub pull request GraphQL response had invalid head repository owner data."
+        )
+    raw_login = raw_owner.get("login")
+    if raw_login is None:
+        return None
+    if not isinstance(raw_login, str):
+        raise GithubClientError(
+            "GitHub pull request GraphQL response had invalid head repository owner login."
+        )
+    return raw_login
+
+
+def _head_label(*, head_owner: str | None, head_ref: object) -> str | None:
+    if head_owner is None or not isinstance(head_ref, str):
+        return None
+    return f"{head_owner}:{head_ref}"
+
+
 def _pull_request_connection_from_graphql(
     *,
     alias: str,
     connection: object,
+    expected_head_label: str | None = None,
     response_name: str,
 ) -> tuple[GithubPullRequest, ...]:
     if connection is None:
@@ -588,10 +620,12 @@ def _pull_request_connection_from_graphql(
     for raw_node in raw_nodes:
         if not isinstance(raw_node, dict):
             raise GithubClientError(
-                f"GitHub {response_name} response had invalid pull request payload for "
-                f"{alias!r}."
+                f"GitHub {response_name} response had invalid pull request payload for {alias!r}."
             )
-        pull_requests.append(
-            GithubPullRequest.model_validate(_pull_request_payload_from_graphql(raw_node))
+        pull_request = GithubPullRequest.model_validate(
+            _pull_request_payload_from_graphql(raw_node)
         )
+        if expected_head_label is not None and pull_request.head.label != expected_head_label:
+            continue
+        pull_requests.append(pull_request)
     return tuple(pull_requests)

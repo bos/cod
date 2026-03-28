@@ -17,18 +17,18 @@ from jj_review.commands.cleanup import (
 from jj_review.commands.review_state import PreparedStatus
 from jj_review.commands.submit import ResolvedGithubRepository
 from jj_review.config import RepoConfig
+from jj_review.github.client import GithubClientError
 from jj_review.models.bookmarks import BookmarkState, GitRemote, RemoteBookmarkState
 from jj_review.models.cache import CachedChange, ReviewState
 from jj_review.models.github import GithubBranchRef, GithubPullRequest
 
 
-def test_should_skip_stack_comment_inspection_for_stale_open_change_without_comment_hint(
-) -> None:
+def test_should_skip_stack_comment_inspection_for_stale_open_change_without_comment_hint() -> (
+    None
+):
     bookmark_state = BookmarkState(
         name="review/feature-aaaaaaaa",
-        remote_targets=(
-            RemoteBookmarkState(remote="origin", targets=("commit-1",)),
-        ),
+        remote_targets=(RemoteBookmarkState(remote="origin", targets=("commit-1",)),),
     )
 
     should_inspect = _should_inspect_stack_comment_cleanup(
@@ -826,11 +826,154 @@ def test_inspect_restack_batches_uncached_head_refs(monkeypatch) -> None:
         )
     )
 
-    assert batch_head_calls == [
-        ("octo-org", "stacked-review", ("review/one", "review/two"))
-    ]
+    assert batch_head_calls == [("octo-org", "stacked-review", ("review/one", "review/two"))]
     assert head_calls == []
     assert inspection.revisions[0].pull_request_lookup is not None
     assert inspection.revisions[1].pull_request_lookup is not None
     assert inspection.revisions[0].pull_request_lookup.state == "open"
     assert inspection.revisions[1].pull_request_lookup.state == "closed"
+
+
+def test_inspect_restack_blocks_when_cached_pr_batch_lookup_fails(monkeypatch) -> None:
+    remote = GitRemote(name="origin", url="git@github.com:octo-org/stacked-review.git")
+    prepared_status = PreparedStatus(
+        github_repository=ResolvedGithubRepository(
+            host="github.com",
+            owner="octo-org",
+            repo="stacked-review",
+        ),
+        github_repository_error=None,
+        prepared=cast(
+            Any,
+            SimpleNamespace(
+                remote=remote,
+                remote_error=None,
+                status_revisions=(
+                    SimpleNamespace(
+                        bookmark="review/one",
+                        bookmark_source="generated",
+                        cached_change=CachedChange(bookmark="review/one", pr_number=1),
+                        revision=SimpleNamespace(
+                            change_id="change-1",
+                            description="one\n",
+                            divergent=False,
+                            subject="one",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        selected_revset="@",
+        trunk_subject="base",
+    )
+
+    class FakeGithubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get_pull_requests_by_numbers(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            pull_numbers,
+        ):
+            raise GithubClientError("Connection refused")
+
+    monkeypatch.setattr(
+        "jj_review.commands.cleanup._build_github_client",
+        lambda **kwargs: FakeGithubClient(),
+    )
+
+    inspection = asyncio.run(
+        _inspect_restack(
+            prepared_restack=PreparedRestack(
+                apply=False,
+                prepared_status=prepared_status,
+            )
+        )
+    )
+
+    assert inspection.github_error == "unavailable - check network connectivity"
+    assert inspection.github_repository == "octo-org/stacked-review"
+    assert inspection.revisions == ()
+
+
+def test_inspect_restack_blocks_when_head_ref_batch_lookup_fails(monkeypatch) -> None:
+    remote = GitRemote(name="origin", url="git@github.com:octo-org/stacked-review.git")
+    prepared_status = PreparedStatus(
+        github_repository=ResolvedGithubRepository(
+            host="github.com",
+            owner="octo-org",
+            repo="stacked-review",
+        ),
+        github_repository_error=None,
+        prepared=cast(
+            Any,
+            SimpleNamespace(
+                remote=remote,
+                remote_error=None,
+                status_revisions=(
+                    SimpleNamespace(
+                        bookmark="review/one",
+                        bookmark_source="generated",
+                        cached_change=None,
+                        revision=SimpleNamespace(
+                            change_id="change-1",
+                            description="one\n",
+                            divergent=False,
+                            subject="one",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        selected_revset="@",
+        trunk_subject="base",
+    )
+
+    class FakeGithubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get_pull_requests_by_numbers(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            pull_numbers,
+        ):
+            return {}
+
+        async def get_pull_requests_by_head_refs(
+            self,
+            owner: str,
+            repo: str,
+            *,
+            head_refs,
+        ):
+            raise GithubClientError("Connection refused")
+
+    monkeypatch.setattr(
+        "jj_review.commands.cleanup._build_github_client",
+        lambda **kwargs: FakeGithubClient(),
+    )
+
+    inspection = asyncio.run(
+        _inspect_restack(
+            prepared_restack=PreparedRestack(
+                apply=False,
+                prepared_status=prepared_status,
+            )
+        )
+    )
+
+    assert inspection.github_error == "unavailable - check network connectivity"
+    assert inspection.github_repository == "octo-org/stacked-review"
+    assert inspection.revisions == ()
